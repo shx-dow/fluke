@@ -1,2 +1,5 @@
 [x] error correction
-[] exrtra features
+[x] added line numbers
+[ ] undo/redo
+[ ] indentation
+[ ] proper syntax highlighting

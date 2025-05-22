@@ -22,6 +22,7 @@
 #define FLUKE_VERSION "0.0.1"
 #define FLUKE_TAB_STOP 8
 #define FLUKE_QUIT_TIMES 3
+#define FLUKE_LINE_NUMBER_WIDTH 6
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -764,9 +765,14 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "~", 1);
       }
     } else {
+      char linenum[16];
+      snprintf(linenum, sizeof(linenum), "%*d ", FLUKE_LINE_NUMBER_WIDTH - 1, filerow + 1);
+      abAppend(ab, "\x1b[90m", 5); // Gray color for line numbers
+      abAppend(ab, linenum, strlen(linenum));
+      abAppend(ab, "\x1b[39m", 5); // Reset to default color
       int len = E.row[filerow].rsize - E.coloff;
       if (len < 0) len = 0;
-      if (len > E.screencols) len = E.screencols;
+      if (len > E.screencols - FLUKE_LINE_NUMBER_WIDTH) len = E.screencols - FLUKE_LINE_NUMBER_WIDTH;
       char *c = &E.row[filerow].render[E.coloff];
       unsigned char *hl = &E.row[filerow].hl[E.coloff];
       int current_color = -1;
@@ -852,7 +858,7 @@ void editorRefreshScreen() {
 
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-                                            (E.rx - E.coloff) + 1);
+                                            (E.rx - E.coloff) + FLUKE_LINE_NUMBER_WIDTH + 1);
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h", 6);
@@ -1047,6 +1053,7 @@ void initEditor() {
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 2;
+  E.screencols -= FLUKE_LINE_NUMBER_WIDTH;
 }
 
 int main(int argc, char *argv[]) {
