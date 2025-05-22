@@ -1,2 +1,2 @@
-[] error correction
+[x] error correction
 [] exrtra features
