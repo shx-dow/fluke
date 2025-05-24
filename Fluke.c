@@ -1,4 +1,4 @@
-/*** includes ***/
+/* includes */
 
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/*** defines ***/
+/* defines */
 
 #define FLUKE_VERSION "0.0.1"
 #define FLUKE_TAB_STOP 8
@@ -53,7 +53,7 @@ enum editorHighlight {
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
 #define HL_HIGHLIGHT_STRINGS (1<<1)
 
-/*** data ***/
+/* data */
 
 struct editorSyntax {
   char *filetype;
@@ -94,7 +94,7 @@ struct editorConfig {
 
 struct editorConfig E;
 
-/*** filetypes ***/
+/* filetypes */
 
 char *C_HL_extensions[] = { ".c", ".h", ".cpp", NULL };
 char *C_HL_keywords[] = {
@@ -117,13 +117,13 @@ struct editorSyntax HLDB[] = {
 
 #define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
-/*** prototypes ***/
+/* prototypes */
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
-/*** terminal ***/
+/* terminal */
 
 void die(const char *s) {
   write(STDOUT_FILENO, "\x1b[2J", 4);
@@ -235,7 +235,7 @@ int getWindowSize(int *rows, int *cols) {
   }
 }
 
-/*** syntax highlighting ***/
+/* syntax highlighting */
 
 int is_separator(int c) {
   return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
@@ -396,7 +396,7 @@ void editorSelectSyntaxHighlight() {
   }
 }
 
-/*** row operations ***/
+/* row operations */
 
 int editorRowCxToRx(erow *row, int cx) {
   int rx = 0;
@@ -512,7 +512,7 @@ void editorRowDelChar(erow *row, int at) {
   E.dirty++;
 }
 
-/*** editor operations ***/
+/* editor operations */
 
 void editorInsertChar(int c) {
   if (E.cy == E.numrows) {
@@ -553,7 +553,7 @@ void editorDelChar() {
   }
 }
 
-/*** file i/o ***/
+/* file i/o */
 
 char *editorRowsToString(int *buflen) {
   int totlen = 0;
@@ -628,7 +628,7 @@ void editorSave() {
   editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
 }
 
-/*** find ***/
+/* find */
 
 void editorFindCallback(char *query, int key) {
   static int last_match = -1;
@@ -700,7 +700,7 @@ void editorFind() {
   }
 }
 
-/*** append buffer ***/
+/* append buffer */
 
 struct abuf {
   char *b;
@@ -722,7 +722,7 @@ void abFree(struct abuf *ab) {
   free(ab->b);
 }
 
-/*** output ***/
+/* output */
 
 void editorScroll() {
   E.rx = 0;
@@ -875,7 +875,7 @@ void editorSetStatusMessage(const char *fmt, ...) {
   E.statusmsg_time = time(NULL);
 }
 
-/*** input ***/
+/* input */
 
 char *editorPrompt(char *prompt, void (*callback)(char *, int)) {
   size_t bufsize = 128;
@@ -1035,7 +1035,7 @@ void editorProcessKeypress() {
   quit_times = FLUKE_QUIT_TIMES;
 }
 
-/*** init ***/
+/* init */
 
 void initEditor() {
   E.cx = 0;
