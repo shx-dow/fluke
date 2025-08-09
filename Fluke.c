@@ -94,6 +94,9 @@ struct editorConfig {
 
 struct editorConfig E;
 
+/* search state */
+static char g_search_query[128] = "";
+
 /* filetypes */
 
 char *C_HL_extensions[] = { ".c", ".h", ".cpp", NULL };
@@ -637,6 +640,14 @@ void editorFindCallback(char *query, int key) {
   static int saved_hl_line;
   static char *saved_hl = NULL;
 
+  /* Incremental: update global query for overlay highlighting */
+  if (query && *query) {
+    strncpy(g_search_query, query, sizeof(g_search_query) - 1);
+    g_search_query[sizeof(g_search_query) - 1] = '\0';
+  } else {
+    g_search_query[0] = '\0';
+  }
+
   if (saved_hl) {
     memcpy(E.row[saved_hl_line].hl, saved_hl, E.row[saved_hl_line].rsize);
     free(saved_hl);
@@ -646,6 +657,10 @@ void editorFindCallback(char *query, int key) {
   if (key == '\r' || key == '\x1b') {
     last_match = -1;
     direction = 1;
+    if (key == '\x1b') {
+      /* cancel overlay highlight on escape */
+      g_search_query[0] = '\0';
+    }
     return;
   } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
     direction = 1;
@@ -691,6 +706,13 @@ void editorFind() {
                              editorFindCallback);
 
   if (query) {
+    /* remember query for incremental highlight */
+    if (*query) {
+      strncpy(g_search_query, query, sizeof(g_search_query) - 1);
+      g_search_query[sizeof(g_search_query) - 1] = '\0';
+    } else {
+      g_search_query[0] = '\0';
+    }
     free(query);
   } else {
     E.cx = saved_cx;
@@ -777,7 +799,21 @@ void editorDrawRows(struct abuf *ab) {
       unsigned char *hl = &E.row[filerow].hl[E.coloff];
       int current_color = -1;
       int j;
+      int qlen = (int)strlen(g_search_query);
       for (j = 0; j < len; j++) {
+        if (qlen > 0 && !iscntrl(c[j]) && j + qlen <= len &&
+            memcmp(&c[j], g_search_query, (size_t)qlen) == 0) {
+          int match_color = editorSyntaxToColor(HL_MATCH);
+          if (match_color != current_color) {
+            current_color = match_color;
+            char buf[16];
+            int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", match_color);
+            abAppend(ab, buf, clen);
+          }
+          abAppend(ab, &c[j], qlen);
+          j += qlen - 1;
+          continue;
+        }
         if (iscntrl(c[j])) {
           char sym = (c[j] <= 26) ? '@' + c[j] : '?';
           abAppend(ab, "\x1b[7m", 4);
@@ -816,11 +852,15 @@ void editorDrawRows(struct abuf *ab) {
 void editorDrawStatusBar(struct abuf *ab) {
   abAppend(ab, "\x1b[7m", 4);
   char status[80], rstatus[80];
-  int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
-    E.filename ? E.filename : "[No Name]", E.numrows,
+  const char *mode = "[INS]";
+  int len = snprintf(status, sizeof(status), "%.20s %s - %d lines %s",
+    E.filename ? E.filename : "[No Name]", mode, E.numrows,
     E.dirty ? "(modified)" : "");
-  int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
-    E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
+  int col = E.rx + 1;
+  int row = E.cy + 1;
+  int percent = (E.numrows ? (row * 100 / E.numrows) : 0);
+  int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d:%d (%d%%)",
+    E.syntax ? E.syntax->filetype : "no ft", row, col, percent);
   if (len > E.screencols) len = E.screencols;
   abAppend(ab, status, len);
   while (len < E.screencols) {
