@@ -93,6 +93,7 @@ struct editorConfig {
   int is_insert_mode;
   int soft_wrap_enabled;
   int vrowoff; /* visual row offset when wrapping */
+  int show_line_numbers;
 };
 
 struct editorConfig E;
@@ -233,6 +234,8 @@ void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 void editorInsertRow(int at, char *s, size_t len);
 void editorFreeRow(erow *row);
+/* forward declarations */
+void editorGotoLine();
 
 /* terminal */
 
@@ -945,10 +948,18 @@ void editorDrawRows(struct abuf *ab) {
       }
     } else {
       char linenum[16];
-      snprintf(linenum, sizeof(linenum), "%*d ", FLUKE_LINE_NUMBER_WIDTH - 1, filerow + 1);
-      abAppend(ab, "\x1b[90m", 5); // Gray color for line numbers
-      abAppend(ab, linenum, strlen(linenum));
-      abAppend(ab, "\x1b[39m", 5); // Reset to default color
+      if (E.show_line_numbers) {
+        snprintf(linenum, sizeof(linenum), "%*d ", FLUKE_LINE_NUMBER_WIDTH - 1, filerow + 1);
+        abAppend(ab, "\x1b[90m", 5); // Gray color for line numbers
+        abAppend(ab, linenum, strlen(linenum));
+        abAppend(ab, "\x1b[39m", 5); // Reset to default color
+      } else {
+        /* keep gutter spacing for consistent layout */
+        memset(linenum, ' ', FLUKE_LINE_NUMBER_WIDTH);
+        linenum[FLUKE_LINE_NUMBER_WIDTH - 1] = ' ';
+        linenum[FLUKE_LINE_NUMBER_WIDTH - 0] = '\0';
+        abAppend(ab, "      ", FLUKE_LINE_NUMBER_WIDTH);
+      }
       int effective_coloff = E.soft_wrap_enabled ? start_col : E.coloff;
       int len = E.row[filerow].rsize - effective_coloff;
       if (len < 0) len = 0;
@@ -1198,6 +1209,7 @@ void editorProcessKeypress() {
       editorSetStatusMessage("Wrap: %s", E.soft_wrap_enabled ? "ON" : "OFF");
       break;
 
+
     case CTRL_KEY('u'):
       undoAction();
       break;
@@ -1280,6 +1292,7 @@ void initEditor() {
   E.is_insert_mode = 1;
   E.soft_wrap_enabled = 0;
   E.vrowoff = 0;
+  E.show_line_numbers = 1;
 
   /* clear undo/redo stacks */
   for (int i = 0; i < g_undo_len; i++) freeSnapshot(g_undo_stack[i]);
@@ -1300,7 +1313,7 @@ int main(int argc, char *argv[]) {
   }
 
   editorSetStatusMessage(
-    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
+    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Ctrl-W wrap | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
 
   while (1) {
     editorRefreshScreen();
