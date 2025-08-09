@@ -91,6 +91,8 @@ struct editorConfig {
   struct editorSyntax *syntax;
   struct termios orig_termios;
   int is_insert_mode;
+  int soft_wrap_enabled;
+  int vrowoff; /* visual row offset when wrapping */
 };
 
 struct editorConfig E;
@@ -861,24 +863,70 @@ void editorScroll() {
     E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
   }
 
-  if (E.cy < E.rowoff) {
-    E.rowoff = E.cy;
-  }
-  if (E.cy >= E.rowoff + E.screenrows) {
-    E.rowoff = E.cy - E.screenrows + 1;
-  }
-  if (E.rx < E.coloff) {
-    E.coloff = E.rx;
-  }
-  if (E.rx >= E.coloff + E.screencols) {
-    E.coloff = E.rx - E.screencols + 1;
+  if (!E.soft_wrap_enabled) {
+    if (E.cy < E.rowoff) {
+      E.rowoff = E.cy;
+    }
+    if (E.cy >= E.rowoff + E.screenrows) {
+      E.rowoff = E.cy - E.screenrows + 1;
+    }
+    if (E.rx < E.coloff) {
+      E.coloff = E.rx;
+    }
+    if (E.rx >= E.coloff + E.screencols) {
+      E.coloff = E.rx - E.screencols + 1;
+    }
+  } else {
+    /* visual-row based vertical scroll; horizontal scroll disabled when wrapping */
+    E.coloff = 0;
+
+    /* compute visual row index of (E.cy, E.rx) and adjust E.vrowoff */
+    int vrow = 0;
+    for (int r = 0; r < E.cy; r++) {
+      int len = E.row[r].rsize;
+      int wraps = len > 0 ? (len - 1) / (E.screencols - FLUKE_LINE_NUMBER_WIDTH) : 0;
+      vrow += 1 + wraps;
+    }
+    int curline_wraps = 0;
+    if (E.cy < E.numrows) {
+      int len = E.row[E.cy].rsize;
+      curline_wraps = len > 0 ? (len - 1) / (E.screencols - FLUKE_LINE_NUMBER_WIDTH) : 0;
+    }
+    int line_vrow = vrow;
+
+    if (line_vrow < E.vrowoff) {
+      E.vrowoff = line_vrow;
+    }
+    if (line_vrow > E.vrowoff + E.screenrows - 1) {
+      E.vrowoff = line_vrow - (E.screenrows - 1);
+    }
   }
 }
 
 void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screenrows; y++) {
-    int filerow = y + E.rowoff;
+    int filerow = E.soft_wrap_enabled ? 0 : (y + E.rowoff);
+    int start_col = 0;
+    int visual_index = y + (E.soft_wrap_enabled ? E.vrowoff : 0);
+
+    if (E.soft_wrap_enabled) {
+      /* map visual_index to (filerow,start_col) */
+      int acc = 0;
+      for (filerow = 0; filerow < E.numrows; filerow++) {
+        int len = E.row[filerow].rsize;
+        int cols = E.screencols - FLUKE_LINE_NUMBER_WIDTH;
+        int wraps = (len <= 0) ? 0 : (len - 1) / cols;
+        int segs = 1 + wraps;
+        if (visual_index < acc + segs) {
+          int within = visual_index - acc;
+          start_col = within * cols;
+          break;
+        }
+        acc += segs;
+      }
+    }
+
     if (filerow >= E.numrows) {
       if (E.numrows == 0 && y == E.screenrows / 3) {
         char welcome[80];
@@ -901,11 +949,12 @@ void editorDrawRows(struct abuf *ab) {
       abAppend(ab, "\x1b[90m", 5); // Gray color for line numbers
       abAppend(ab, linenum, strlen(linenum));
       abAppend(ab, "\x1b[39m", 5); // Reset to default color
-      int len = E.row[filerow].rsize - E.coloff;
+      int effective_coloff = E.soft_wrap_enabled ? start_col : E.coloff;
+      int len = E.row[filerow].rsize - effective_coloff;
       if (len < 0) len = 0;
       if (len > E.screencols - FLUKE_LINE_NUMBER_WIDTH) len = E.screencols - FLUKE_LINE_NUMBER_WIDTH;
-      char *c = &E.row[filerow].render[E.coloff];
-      unsigned char *hl = &E.row[filerow].hl[E.coloff];
+      char *c = &E.row[filerow].render[effective_coloff];
+      unsigned char *hl = &E.row[filerow].hl[effective_coloff];
       int current_color = -1;
       int j;
       int qlen = (int)strlen(g_search_query);
@@ -968,8 +1017,9 @@ void editorDrawStatusBar(struct abuf *ab) {
   int col = E.rx + 1;
   int row = E.cy + 1;
   int percent = (E.numrows ? (row * 100 / E.numrows) : 0);
-  int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d:%d (%d%%)",
-    E.syntax ? E.syntax->filetype : "no ft", row, col, percent);
+  int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d:%d (%d%%) %s",
+    E.syntax ? E.syntax->filetype : "no ft", row, col, percent,
+    E.soft_wrap_enabled ? "WRAP" : "NOWRAP");
   if (len > E.screencols) len = E.screencols;
   abAppend(ab, status, len);
   while (len < E.screencols) {
@@ -1007,7 +1057,7 @@ void editorRefreshScreen() {
 
   char buf[32];
   snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1,
-                                            (E.rx - E.coloff) + FLUKE_LINE_NUMBER_WIDTH + 1);
+                                            (E.rx - (E.soft_wrap_enabled ? 0 : E.coloff)) + FLUKE_LINE_NUMBER_WIDTH + 1);
   abAppend(&ab, buf, strlen(buf));
 
   abAppend(&ab, "\x1b[?25h", 6);
@@ -1142,6 +1192,12 @@ void editorProcessKeypress() {
       editorFind();
       break;
 
+    case CTRL_KEY('w'):
+      E.soft_wrap_enabled = !E.soft_wrap_enabled;
+      E.vrowoff = 0;
+      editorSetStatusMessage("Wrap: %s", E.soft_wrap_enabled ? "ON" : "OFF");
+      break;
+
     case CTRL_KEY('u'):
       undoAction();
       break;
@@ -1222,6 +1278,8 @@ void initEditor() {
   E.statusmsg_time = 0;
   E.syntax = NULL;
   E.is_insert_mode = 1;
+  E.soft_wrap_enabled = 0;
+  E.vrowoff = 0;
 
   /* clear undo/redo stacks */
   for (int i = 0; i < g_undo_len; i++) freeSnapshot(g_undo_stack[i]);
