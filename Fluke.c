@@ -90,12 +90,116 @@ struct editorConfig {
   time_t statusmsg_time;
   struct editorSyntax *syntax;
   struct termios orig_termios;
+  int is_insert_mode;
 };
 
 struct editorConfig E;
 
 /* search state */
 static char g_search_query[128] = "";
+
+/* forward decls used by undo/redo helpers */
+void editorInsertRow(int at, char *s, size_t len);
+void editorFreeRow(erow *row);
+
+/* undo/redo */
+#define FLUKE_UNDO_MAX 128
+typedef struct BufferSnapshot {
+  int numrows;
+  char **rows;
+  int *sizes;
+  int cx, cy, rowoff, coloff;
+} BufferSnapshot;
+
+static BufferSnapshot *g_undo_stack[FLUKE_UNDO_MAX];
+static int g_undo_len = 0;
+static BufferSnapshot *g_redo_stack[FLUKE_UNDO_MAX];
+static int g_redo_len = 0;
+
+static void freeSnapshot(BufferSnapshot *s) {
+  if (!s) return;
+  if (s->rows) {
+    for (int i = 0; i < s->numrows; i++) free(s->rows[i]);
+    free(s->rows);
+  }
+  free(s->sizes);
+  free(s);
+}
+
+static BufferSnapshot *takeSnapshot() {
+  BufferSnapshot *s = (BufferSnapshot *)calloc(1, sizeof(BufferSnapshot));
+  s->numrows = E.numrows;
+  s->rows = (char **)calloc((size_t)E.numrows, sizeof(char *));
+  s->sizes = (int *)calloc((size_t)E.numrows, sizeof(int));
+  for (int i = 0; i < E.numrows; i++) {
+    s->sizes[i] = E.row[i].size;
+    s->rows[i] = (char *)malloc((size_t)E.row[i].size + 1);
+    memcpy(s->rows[i], E.row[i].chars, (size_t)E.row[i].size);
+    s->rows[i][E.row[i].size] = '\0';
+  }
+  s->cx = E.cx; s->cy = E.cy; s->rowoff = E.rowoff; s->coloff = E.coloff;
+  return s;
+}
+
+static void restoreFromSnapshot(BufferSnapshot *s) {
+  /* free current buffer */
+  for (int i = 0; i < E.numrows; i++) editorFreeRow(&E.row[i]);
+  free(E.row);
+  E.row = NULL;
+  E.numrows = 0;
+
+  /* rebuild from snapshot */
+  for (int i = 0; i < s->numrows; i++) {
+    editorInsertRow(E.numrows, s->rows[i], s->sizes[i]);
+  }
+  E.cx = s->cx; E.cy = s->cy; E.rowoff = s->rowoff; E.coloff = s->coloff;
+  E.dirty++;
+}
+
+static void clearRedoStack() {
+  for (int i = 0; i < g_redo_len; i++) freeSnapshot(g_redo_stack[i]);
+  g_redo_len = 0;
+}
+
+static void pushUndoSnapshot() {
+  if (g_undo_len == FLUKE_UNDO_MAX) {
+    freeSnapshot(g_undo_stack[0]);
+    memmove(&g_undo_stack[0], &g_undo_stack[1], sizeof(g_undo_stack) - sizeof(g_undo_stack[0]));
+    g_undo_len--;
+  }
+  g_undo_stack[g_undo_len++] = takeSnapshot();
+  clearRedoStack();
+}
+
+static void undoAction() {
+  if (g_undo_len == 0) return;
+  /* push current to redo */
+  if (g_redo_len == FLUKE_UNDO_MAX) {
+    freeSnapshot(g_redo_stack[0]);
+    memmove(&g_redo_stack[0], &g_redo_stack[1], sizeof(g_redo_stack) - sizeof(g_redo_stack[0]));
+    g_redo_len--;
+  }
+  g_redo_stack[g_redo_len++] = takeSnapshot();
+
+  BufferSnapshot *s = g_undo_stack[--g_undo_len];
+  restoreFromSnapshot(s);
+  freeSnapshot(s);
+}
+
+static void redoAction() {
+  if (g_redo_len == 0) return;
+  /* push current to undo */
+  if (g_undo_len == FLUKE_UNDO_MAX) {
+    freeSnapshot(g_undo_stack[0]);
+    memmove(&g_undo_stack[0], &g_undo_stack[1], sizeof(g_undo_stack) - sizeof(g_undo_stack[0]));
+    g_undo_len--;
+  }
+  g_undo_stack[g_undo_len++] = takeSnapshot();
+
+  BufferSnapshot *s = g_redo_stack[--g_redo_len];
+  restoreFromSnapshot(s);
+  freeSnapshot(s);
+}
 
 /* filetypes */
 
@@ -125,6 +229,8 @@ struct editorSyntax HLDB[] = {
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
+void editorInsertRow(int at, char *s, size_t len);
+void editorFreeRow(erow *row);
 
 /* terminal */
 
@@ -518,6 +624,7 @@ void editorRowDelChar(erow *row, int at) {
 /* editor operations */
 
 void editorInsertChar(int c) {
+  pushUndoSnapshot();
   if (E.cy == E.numrows) {
     editorInsertRow(E.numrows, "", 0);
   }
@@ -526,6 +633,7 @@ void editorInsertChar(int c) {
 }
 
 void editorInsertNewline() {
+  pushUndoSnapshot();
   if (E.cx == 0) {
     editorInsertRow(E.cy, "", 0);
   } else {
@@ -544,6 +652,7 @@ void editorDelChar() {
   if (E.cy == E.numrows) return;
   if (E.cx == 0 && E.cy == 0) return;
 
+  pushUndoSnapshot();
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
     editorRowDelChar(row, E.cx - 1);
@@ -852,7 +961,7 @@ void editorDrawRows(struct abuf *ab) {
 void editorDrawStatusBar(struct abuf *ab) {
   abAppend(ab, "\x1b[7m", 4);
   char status[80], rstatus[80];
-  const char *mode = "[INS]";
+  const char *mode = E.is_insert_mode ? "[INS]" : "[NOR]";
   int len = snprintf(status, sizeof(status), "%.20s %s - %d lines %s",
     E.filename ? E.filename : "[No Name]", mode, E.numrows,
     E.dirty ? "(modified)" : "");
@@ -1001,7 +1110,7 @@ void editorProcessKeypress() {
 
   switch (c) {
     case '\r':
-      editorInsertNewline();
+      if (E.is_insert_mode) editorInsertNewline();
       break;
 
     case CTRL_KEY('q'):
@@ -1033,9 +1142,18 @@ void editorProcessKeypress() {
       editorFind();
       break;
 
+    case CTRL_KEY('u'):
+      undoAction();
+      break;
+
+    case CTRL_KEY('r'):
+      redoAction();
+      break;
+
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
+      if (!E.is_insert_mode) break;
       if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
       editorDelChar();
       break;
@@ -1064,11 +1182,24 @@ void editorProcessKeypress() {
       break;
 
     case CTRL_KEY('l'):
+      break;
+
     case '\x1b':
+      E.is_insert_mode = 0; /* go to normal */
       break;
 
     default:
-      editorInsertChar(c);
+      if (E.is_insert_mode) {
+        editorInsertChar(c);
+      } else {
+        /* simple normal-mode motions: h/j/k/l, x, i */
+        if (c == 'h') editorMoveCursor(ARROW_LEFT);
+        else if (c == 'l') editorMoveCursor(ARROW_RIGHT);
+        else if (c == 'k') editorMoveCursor(ARROW_UP);
+        else if (c == 'j') editorMoveCursor(ARROW_DOWN);
+        else if (c == 'x') editorDelChar();
+        else if (c == 'i') E.is_insert_mode = 1;
+      }
       break;
   }
 
@@ -1090,6 +1221,13 @@ void initEditor() {
   E.statusmsg[0] = '\0';
   E.statusmsg_time = 0;
   E.syntax = NULL;
+  E.is_insert_mode = 1;
+
+  /* clear undo/redo stacks */
+  for (int i = 0; i < g_undo_len; i++) freeSnapshot(g_undo_stack[i]);
+  g_undo_len = 0;
+  for (int i = 0; i < g_redo_len; i++) freeSnapshot(g_redo_stack[i]);
+  g_redo_len = 0;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 2;
@@ -1104,7 +1242,7 @@ int main(int argc, char *argv[]) {
   }
 
   editorSetStatusMessage(
-    "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
 
   while (1) {
     editorRefreshScreen();
