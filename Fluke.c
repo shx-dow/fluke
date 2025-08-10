@@ -16,6 +16,9 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 /* defines */
 
@@ -234,14 +237,24 @@ void editorRefreshScreen();
 char *editorPrompt(char *prompt, void (*callback)(char *, int));
 void editorInsertRow(int at, char *s, size_t len);
 void editorFreeRow(erow *row);
-/* forward declarations */
 void editorGotoLine();
+void editorCommandPalette();
+static void editorToggleWrap();
+static void editorToggleLineNumbers();
+static void editorQuitNow();
+void editorOpenPrompt();
+static void persistCursorPositionIfAny();
+static void restoreCursorPositionIfAny();
+static int fuzzyScore(const char *pattern, const char *candidate);
+static void commandPaletteCallback(char *query, int key);
+static void openFilePromptCallback(char *query, int key);
+static void editorClearBuffer();
 
 /* terminal */
 
 void die(const char *s) {
-  write(STDOUT_FILENO, "\x1b[2J", 4);
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  (void)write(STDOUT_FILENO, "\x1b[2J", 4);
+  (void)write(STDOUT_FILENO, "\x1b[H", 3);
 
   perror(s);
   exit(1);
@@ -712,6 +725,9 @@ void editorOpen(char *filename) {
   free(line);
   fclose(fp);
   E.dirty = 0;
+
+  /* attempt to restore prior cursor position for this file */
+  restoreCursorPositionIfAny();
 }
 
 void editorSave() {
@@ -836,6 +852,323 @@ void editorFind() {
   }
 }
 
+/* navigation utilities */
+
+void editorGotoLine() {
+  if (E.numrows == 0) {
+    editorSetStatusMessage("Buffer is empty");
+    return;
+  }
+
+  char *resp = editorPrompt("Go to line: %s", NULL);
+  if (!resp) return;
+  long val = strtol(resp, NULL, 10);
+  free(resp);
+  if (val <= 0) val = 1;
+  if (val > E.numrows) val = E.numrows;
+  E.cy = (int)val - 1;
+  if (E.cy < 0) E.cy = 0;
+  if (E.cy >= E.numrows) E.cy = E.numrows - 1;
+  if (E.cy < 0) E.cy = 0;
+  int rowlen = (E.cy >= 0 && E.cy < E.numrows) ? E.row[E.cy].size : 0;
+  if (E.cx > rowlen) E.cx = rowlen;
+  E.rowoff = E.cy;
+  if (E.rowoff < 0) E.rowoff = 0;
+  E.coloff = 0;
+}
+
+/* command palette and toggles */
+
+static void editorToggleWrap() {
+  E.soft_wrap_enabled = !E.soft_wrap_enabled;
+  E.vrowoff = 0;
+  editorSetStatusMessage("Wrap: %s", E.soft_wrap_enabled ? "ON" : "OFF");
+}
+
+static void editorToggleLineNumbers() {
+  E.show_line_numbers = !E.show_line_numbers;
+  editorSetStatusMessage("Line numbers: %s", E.show_line_numbers ? "ON" : "OFF");
+}
+
+static void editorQuitNow() {
+  persistCursorPositionIfAny();
+  write(STDOUT_FILENO, "\x1b[2J", 4);
+  write(STDOUT_FILENO, "\x1b[H", 3);
+  exit(0);
+}
+
+typedef struct CommandEntry {
+  const char *name;
+} CommandEntry;
+
+/* command list must be defined before use */
+static const CommandEntry g_commands[] = {
+  {"save"}, {"write"},
+  {"quit"}, {"quit!"},
+  {"wrap"}, {"nowrap"},
+  {"lines"}, {"nolines"},
+  {"goto"}, {"find"},
+  {"open"},
+  {"help"}
+};
+
+void editorCommandPalette() {
+  char *cmd = editorPrompt("Command: %s", commandPaletteCallback);
+  if (!cmd) return;
+
+  /* trim leading/trailing spaces */
+  char *s = cmd;
+  while (*s && isspace((unsigned char)*s)) s++;
+  char *e = s + strlen(s);
+  while (e > s && isspace((unsigned char)e[-1])) e--;
+  *e = '\0';
+
+  if (*s == '\0') { free(cmd); return; }
+
+  /* simplistic matching: prefix or full */
+  if (!strcmp(s, "save") || !strcmp(s, "write")) {
+    editorSave();
+  } else if (!strcmp(s, "quit!")) {
+    editorQuitNow();
+  } else if (!strcmp(s, "quit")) {
+    if (E.dirty) {
+      editorSetStatusMessage("Unsaved changes. Use quit! or Ctrl-Q to force quit.");
+    } else {
+      editorQuitNow();
+    }
+  } else if (!strcmp(s, "wrap")) {
+    if (!E.soft_wrap_enabled) editorToggleWrap(); else editorSetStatusMessage("Wrap: ON");
+  } else if (!strcmp(s, "nowrap")) {
+    if (E.soft_wrap_enabled) editorToggleWrap(); else editorSetStatusMessage("Wrap: OFF");
+  } else if (!strcmp(s, "lines")) {
+    if (!E.show_line_numbers) editorToggleLineNumbers(); else editorSetStatusMessage("Line numbers: ON");
+  } else if (!strcmp(s, "nolines")) {
+    if (E.show_line_numbers) editorToggleLineNumbers(); else editorSetStatusMessage("Line numbers: OFF");
+  } else if (!strcmp(s, "goto")) {
+    editorGotoLine();
+  } else if (!strcmp(s, "find")) {
+    editorFind();
+  } else if (!strcmp(s, "open")) {
+    editorOpenPrompt();
+  } else if (!strcmp(s, "help")) {
+    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open");
+  } else {
+    /* try partial match against known commands */
+    int matched = 0;
+    for (unsigned int i = 0; i < sizeof(g_commands)/sizeof(g_commands[0]); i++) {
+      if (strstr(g_commands[i].name, s)) { matched = 1; break; }
+    }
+    if (matched) editorSetStatusMessage("Did you mean: save | quit | quit! | wrap | nowrap | lines | nolines | goto | find | open");
+    else editorSetStatusMessage("Unknown command: %s", s);
+  }
+
+  free(cmd);
+}
+
+static void commandPaletteCallback(char *query, int key) {
+  (void)key; /* unused parameter */
+  if (!query) return;
+  int bestIdx = -1;
+  int bestScore = -1;
+  for (unsigned int i = 0; i < sizeof(g_commands)/sizeof(g_commands[0]); i++) {
+    int s = fuzzyScore(query, g_commands[i].name);
+    if (s > bestScore) { bestScore = s; bestIdx = (int)i; }
+  }
+  if (bestIdx >= 0 && bestScore > 0) {
+    editorSetStatusMessage("%s", g_commands[bestIdx].name);
+  } else if (query && *query) {
+    editorSetStatusMessage("No match");
+  } else {
+    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open");
+  }
+}
+
+/* File browser data structure */
+typedef struct {
+  char **files;
+  int *scores;
+  int count;
+  int selected;
+  char search[256];
+} FileBrowser;
+
+static FileBrowser g_browser = {0};
+
+/* File browser implementation moved after abuf definition */
+void editorOpenPrompt(); /* Forward declaration */
+
+/* Old file prompt callback removed - using new file browser instead */
+
+/* persistence of cursor position */
+static const char *cursor_state_filename = ".fluke_cursor";
+
+static int getStateFilePath(char *out, size_t outsz) {
+  const char *home = getenv("HOME");
+  if (!home || !*home) home = ".";
+  int n = snprintf(out, outsz, "%s/%s", home, cursor_state_filename);
+  return (n > 0 && (size_t)n < outsz) ? 0 : -1;
+}
+
+static int makeAbsolutePath(const char *in, char *out, size_t outsz) {
+  if (!in || !*in) return -1;
+  char *res = realpath(in, out);
+  if (res) return 0;
+  /* if realpath fails (e.g., file not yet created), try to compose from CWD */
+  char cwd[PATH_MAX];
+  if (!getcwd(cwd, sizeof(cwd))) return -1;
+  int n = snprintf(out, outsz, "%s/%s", cwd, in);
+  return (n > 0 && (size_t)n < outsz) ? 0 : -1;
+}
+
+static void persistCursorPositionIfAny() {
+  if (!E.filename) return;
+
+  char state_path[PATH_MAX];
+  if (getStateFilePath(state_path, sizeof(state_path)) != 0) return;
+
+  char abspath[PATH_MAX];
+  if (makeAbsolutePath(E.filename, abspath, sizeof(abspath)) != 0) return;
+
+  /* read existing entries if any */
+  FILE *fp = fopen(state_path, "r");
+  char *buf = NULL; size_t cap = 0; ssize_t len;
+  int updated = 0;
+  size_t lines_cap = 0, lines_len = 0;
+  char **lines = NULL;
+
+  if (fp) {
+    while ((len = getline(&buf, &cap, fp)) != -1) {
+      if (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
+      /* parse path\trow\tcol */
+      char *tab1 = strchr(buf, '\t');
+      if (!tab1) {
+        /* keep line as-is */
+      } else {
+        *tab1 = '\0';
+        const char *path = buf;
+        char *tab2 = strchr(tab1 + 1, '\t');
+        if (tab2) *tab2 = '\0';
+        if (strcmp(path, abspath) == 0) {
+          /* replace with new entry */
+          char newline[256];
+          int n = snprintf(newline, sizeof(newline), "%s\t%d\t%d", abspath, E.cy, E.cx);
+          if (n > 0) {
+            if (lines_len == lines_cap) {
+              lines_cap = lines_cap ? lines_cap * 2 : 8;
+              lines = realloc(lines, lines_cap * sizeof(char*));
+            }
+            lines[lines_len++] = strndup(newline, (size_t)n);
+            updated = 1;
+            continue; /* skip adding original */
+          }
+        }
+        if (tab2) *tab2 = '\t';
+        *tab1 = '\t';
+      }
+      if (lines_len == lines_cap) {
+        lines_cap = lines_cap ? lines_cap * 2 : 8;
+        lines = realloc(lines, lines_cap * sizeof(char*));
+      }
+      lines[lines_len++] = strndup(buf, (size_t)len);
+    }
+    fclose(fp);
+    free(buf);
+  }
+
+  if (!updated) {
+    char newline[256];
+    int n = snprintf(newline, sizeof(newline), "%s\t%d\t%d", abspath, E.cy, E.cx);
+    if (n > 0) {
+      if (lines_len == lines_cap) {
+        lines_cap = lines_cap ? lines_cap * 2 : 8;
+        lines = realloc(lines, lines_cap * sizeof(char*));
+      }
+      lines[lines_len++] = strndup(newline, (size_t)n);
+    }
+  }
+
+  /* write back */
+  fp = fopen(state_path, "w");
+  if (!fp) {
+    for (size_t i = 0; i < lines_len; i++) free(lines[i]);
+    free(lines);
+    return;
+  }
+  for (size_t i = 0; i < lines_len; i++) {
+    fputs(lines[i], fp);
+    fputc('\n', fp);
+    free(lines[i]);
+  }
+  free(lines);
+  fclose(fp);
+}
+
+static void restoreCursorPositionIfAny() {
+  if (!E.filename) return;
+  char state_path[PATH_MAX];
+  if (getStateFilePath(state_path, sizeof(state_path)) != 0) return;
+  char abspath[PATH_MAX];
+  if (makeAbsolutePath(E.filename, abspath, sizeof(abspath)) != 0) return;
+
+  FILE *fp = fopen(state_path, "r");
+  if (!fp) return;
+
+  char *line = NULL; size_t cap = 0; ssize_t len;
+  while ((len = getline(&line, &cap, fp)) != -1) {
+    if (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+    char *tab1 = strchr(line, '\t');
+    if (!tab1) continue;
+    *tab1 = '\0';
+    if (strcmp(line, abspath) != 0) { *tab1 = '\t'; continue; }
+    char *tab2 = strchr(tab1 + 1, '\t');
+    if (!tab2) { *tab1 = '\t'; continue; }
+    *tab2 = '\0';
+    int row = atoi(tab1 + 1);
+    int col = atoi(tab2 + 1);
+    if (row < 0) row = 0;
+    if (row >= E.numrows) row = E.numrows ? E.numrows - 1 : 0;
+    E.cy = row;
+    int rowlen = (E.cy >= 0 && E.cy < E.numrows) ? E.row[E.cy].size : 0;
+    if (col < 0) col = 0;
+    if (col > rowlen) col = rowlen;
+    E.cx = col;
+    break;
+  }
+  free(line);
+  fclose(fp);
+}
+
+/* very small fuzzy scorer: subsequence match weighted by adjacency */
+static int fuzzyScore(const char *pattern, const char *candidate) {
+  if (!pattern || !*pattern) return 0;
+  if (!candidate || !*candidate) return 0;
+  int score = 0;
+  int consec = 0;
+  const char *p = pattern;
+  for (const char *c = candidate; *c && *p; c++) {
+    if (tolower((unsigned char)*c) == tolower((unsigned char)*p)) {
+      score += 1 + consec; /* reward consecutive */
+      consec++;
+      p++;
+    } else {
+      consec = 0;
+    }
+  }
+  if (*p) return 0; /* not all pattern chars matched in order */
+  return score;
+}
+
+/* clear current buffer contents */
+static void editorClearBuffer() {
+  for (int i = 0; i < E.numrows; i++) editorFreeRow(&E.row[i]);
+  free(E.row);
+  E.row = NULL;
+  E.numrows = 0;
+  E.cx = 0; E.cy = 0; E.rx = 0;
+  E.rowoff = 0; E.coloff = 0; E.vrowoff = 0;
+  E.dirty = 0;
+}
+
 /* append buffer */
 
 struct abuf {
@@ -856,6 +1189,279 @@ void abAppend(struct abuf *ab, const char *s, int len) {
 
 void abFree(struct abuf *ab) {
   free(ab->b);
+}
+
+/* File browser implementations */
+static void freeBrowser() {
+  if (g_browser.files) {
+    for (int i = 0; i < g_browser.count; i++) {
+      free(g_browser.files[i]);
+    }
+    free(g_browser.files);
+    free(g_browser.scores);
+  }
+  g_browser.files = NULL;
+  g_browser.scores = NULL;
+  g_browser.count = 0;
+  g_browser.selected = 0;
+  g_browser.search[0] = '\0';
+}
+
+static void loadFiles() {
+  freeBrowser();
+  
+  DIR *dir = opendir(".");
+  if (!dir) return;
+  
+  /* Count files first */
+  struct dirent *ent;
+  int fileCount = 0;
+  while ((ent = readdir(dir))) {
+    if (ent->d_name[0] == '.') continue;
+    fileCount++;
+  }
+  rewinddir(dir);
+  
+  if (fileCount == 0) {
+    closedir(dir);
+    return;
+  }
+  
+  /* Allocate arrays */
+  g_browser.files = malloc(fileCount * sizeof(char*));
+  g_browser.scores = malloc(fileCount * sizeof(int));
+  g_browser.count = 0;
+  
+  /* Load files */
+  while ((ent = readdir(dir))) {
+    if (ent->d_name[0] == '.') continue;
+    g_browser.files[g_browser.count] = strdup(ent->d_name);
+    g_browser.scores[g_browser.count] = 0;
+    g_browser.count++;
+  }
+  closedir(dir);
+}
+
+static void updateBrowserScores() {
+  if (!g_browser.files) return;
+  
+  for (int i = 0; i < g_browser.count; i++) {
+    if (g_browser.search[0] == '\0') {
+      g_browser.scores[i] = 1; /* show all files when no search */
+    } else {
+      g_browser.scores[i] = fuzzyScore(g_browser.search, g_browser.files[i]);
+    }
+  }
+  
+  /* Sort by score (simple bubble sort) */
+  for (int i = 0; i < g_browser.count - 1; i++) {
+    for (int j = 0; j < g_browser.count - i - 1; j++) {
+      if (g_browser.scores[j] < g_browser.scores[j + 1]) {
+        /* Swap scores */
+        int tempScore = g_browser.scores[j];
+        g_browser.scores[j] = g_browser.scores[j + 1];
+        g_browser.scores[j + 1] = tempScore;
+        
+        /* Swap files */
+        char *tempFile = g_browser.files[j];
+        g_browser.files[j] = g_browser.files[j + 1];
+        g_browser.files[j + 1] = tempFile;
+      }
+    }
+  }
+  
+  /* Reset selection to first visible file */
+  g_browser.selected = 0;
+  if (g_browser.search[0] != '\0') {
+    for (int i = 0; i < g_browser.count; i++) {
+      if (g_browser.scores[i] > 0) {
+        g_browser.selected = i;
+        break;
+      }
+    }
+  }
+}
+
+static void drawFileBrowser(struct abuf *ab) {
+  int maxRows = E.screenrows - 8; /* Leave more space */
+  int maxCols = E.screencols - 6;
+  int startRow = 3;
+  int startCol = 3;
+  
+  /* Clear entire screen first */
+  abAppend(ab, "\x1b[2J", 4);
+  abAppend(ab, "\x1b[H", 3);
+  
+  /* Draw top border */
+  char topBorder[256];
+  snprintf(topBorder, sizeof(topBorder), "\x1b[%d;%dH", startRow, startCol);
+  abAppend(ab, topBorder, strlen(topBorder));
+  abAppend(ab, "\x1b[44;37m", 8); /* Blue background, white text */
+  abAppend(ab, "+", 1);
+  for (int i = 0; i < maxCols - 2; i++) abAppend(ab, "-", 1);
+  abAppend(ab, "+", 1);
+  abAppend(ab, "\x1b[m", 3); /* Reset */
+  
+  /* Draw title */
+  char titleLine[256];
+  snprintf(titleLine, sizeof(titleLine), "\x1b[%d;%dH\x1b[44;37m| FILE BROWSER - %d files found", 
+           startRow + 1, startCol, g_browser.count);
+  abAppend(ab, titleLine, strlen(titleLine));
+  
+  /* Pad title line */
+  int titleLen = strlen("| FILE BROWSER - ") + snprintf(NULL, 0, "%d files found", g_browser.count);
+  for (int i = titleLen; i < maxCols - 1; i++) abAppend(ab, " ", 1);
+  abAppend(ab, "|\x1b[m", 5);
+  
+  /* Draw search line */
+  char searchLine[512];
+  int searchWidth = maxCols - 12;
+  if (searchWidth < 0) searchWidth = 0;
+  if (searchWidth > 200) searchWidth = 200; /* Reasonable limit */
+  snprintf(searchLine, sizeof(searchLine), "\x1b[%d;%dH\x1b[44;37m| Search: %-*.*s|\x1b[m", 
+           startRow + 2, startCol, searchWidth, searchWidth, g_browser.search);
+  abAppend(ab, searchLine, strlen(searchLine));
+  
+  /* Draw separator */
+  char sepLine[256];
+  snprintf(sepLine, sizeof(sepLine), "\x1b[%d;%dH\x1b[44;37m+", startRow + 3, startCol);
+  abAppend(ab, sepLine, strlen(sepLine));
+  for (int i = 0; i < maxCols - 2; i++) abAppend(ab, "-", 1);
+  abAppend(ab, "+\x1b[m", 5);
+  
+  /* Draw files */
+  int visibleCount = 0;
+  for (int i = 0; i < g_browser.count && visibleCount < maxRows - 4; i++) {
+    if (g_browser.scores[i] <= 0 && g_browser.search[0] != '\0') continue;
+    
+    char fileLine[512];
+    int row = startRow + 4 + visibleCount;
+    
+    if (i == g_browser.selected) {
+      /* Selected file - highlighted */
+      snprintf(fileLine, sizeof(fileLine), "\x1b[%d;%dH\x1b[47;30m|>%-*.*s|\x1b[m", 
+               row, startCol, maxCols - 4, maxCols - 4, g_browser.files[i]);
+    } else {
+      /* Normal file */
+      snprintf(fileLine, sizeof(fileLine), "\x1b[%d;%dH\x1b[44;37m| %-*.*s|\x1b[m", 
+               row, startCol, maxCols - 4, maxCols - 4, g_browser.files[i]);
+    }
+    abAppend(ab, fileLine, strlen(fileLine));
+    visibleCount++;
+  }
+  
+  /* Fill remaining rows */
+  for (int i = visibleCount; i < maxRows - 4; i++) {
+    char emptyLine[256];
+    snprintf(emptyLine, sizeof(emptyLine), "\x1b[%d;%dH\x1b[44;37m|", startRow + 4 + i, startCol);
+    abAppend(ab, emptyLine, strlen(emptyLine));
+    for (int j = 0; j < maxCols - 2; j++) abAppend(ab, " ", 1);
+    abAppend(ab, "|\x1b[m", 5);
+  }
+  
+  /* Draw bottom border */
+  char bottomLine[256];
+  snprintf(bottomLine, sizeof(bottomLine), "\x1b[%d;%dH\x1b[44;37m+", startRow + maxRows, startCol);
+  abAppend(ab, bottomLine, strlen(bottomLine));
+  for (int i = 0; i < maxCols - 2; i++) abAppend(ab, "-", 1);
+  abAppend(ab, "+\x1b[m", 5);
+  
+  /* Draw help line */
+  char helpLine[256];
+  snprintf(helpLine, sizeof(helpLine), "\x1b[%d;%dH\x1b[43;30m ENTER=Open | ESC=Cancel | UP/DOWN=Navigate | Type=Search \x1b[m", 
+           startRow + maxRows + 1, startCol);
+  abAppend(ab, helpLine, strlen(helpLine));
+}
+
+/* File browser main function - real implementation */
+void editorOpenPrompt() {
+  if (E.dirty) {
+    char *ans = editorPrompt("Discard changes? y/N: %s", NULL);
+    if (!ans) return; /* ESC cancels */
+    int discard = (ans[0] == 'y' || ans[0] == 'Y');
+    free(ans);
+    if (!discard) { editorSetStatusMessage("Open canceled"); return; }
+  }
+  
+  loadFiles();
+  updateBrowserScores();
+  
+  if (g_browser.count == 0) {
+    editorSetStatusMessage("No files found in current directory");
+    freeBrowser();
+    return;
+  }
+  
+  /* Show cursor */
+  write(STDOUT_FILENO, "\x1b[?25h", 6);
+  
+  while (1) {
+    /* Draw browser */
+    struct abuf ab = ABUF_INIT;
+    drawFileBrowser(&ab);
+    
+    /* Position cursor in search box */
+    char cursorPos[32];
+    snprintf(cursorPos, sizeof(cursorPos), "\x1b[%d;%dH", 6, 13 + (int)strlen(g_browser.search));
+    abAppend(&ab, cursorPos, strlen(cursorPos));
+    
+    /* Flush to screen */
+    write(STDOUT_FILENO, ab.b, ab.len);
+    abFree(&ab);
+    
+    /* Get user input */
+    int c = editorReadKey();
+    
+    if (c == '\x1b') { /* Escape */
+      editorSetStatusMessage("Open canceled");
+      break;
+    } else if (c == '\r') { /* Enter */
+      if (g_browser.selected < g_browser.count) {
+        char *selectedFile = g_browser.files[g_browser.selected];
+        editorClearBuffer();
+        editorOpen(selectedFile);
+        editorSetStatusMessage("Opened: %s", selectedFile);
+      }
+      break;
+    } else if (c == ARROW_UP) {
+      if (g_browser.selected > 0) {
+        g_browser.selected--;
+        /* Skip invisible files when searching */
+        while (g_browser.selected > 0 && g_browser.search[0] != '\0' && g_browser.scores[g_browser.selected] <= 0) {
+          g_browser.selected--;
+        }
+      }
+    } else if (c == ARROW_DOWN) {
+      if (g_browser.selected < g_browser.count - 1) {
+        g_browser.selected++;
+        /* Skip invisible files when searching */
+        while (g_browser.selected < g_browser.count - 1 && g_browser.search[0] != '\0' && g_browser.scores[g_browser.selected] <= 0) {
+          g_browser.selected++;
+        }
+      }
+    } else if (c == BACKSPACE || c == DEL_KEY || c == CTRL_KEY('h')) {
+      /* Remove character from search */
+      int len = strlen(g_browser.search);
+      if (len > 0) {
+        g_browser.search[len - 1] = '\0';
+        updateBrowserScores();
+      }
+    } else if (!iscntrl(c) && c < 128) {
+      /* Add character to search */
+      size_t len = strlen(g_browser.search);
+      if (len < sizeof(g_browser.search) - 1) {
+        g_browser.search[len] = c;
+        g_browser.search[len + 1] = '\0';
+        updateBrowserScores();
+      }
+    }
+  }
+  
+  freeBrowser();
+  
+  /* Hide cursor and restore screen */
+  write(STDOUT_FILENO, "\x1b[?25l", 6);
+  editorRefreshScreen();
 }
 
 /* output */
@@ -1203,12 +1809,25 @@ void editorProcessKeypress() {
       editorFind();
       break;
 
-    case CTRL_KEY('w'):
-      E.soft_wrap_enabled = !E.soft_wrap_enabled;
-      E.vrowoff = 0;
-      editorSetStatusMessage("Wrap: %s", E.soft_wrap_enabled ? "ON" : "OFF");
+    case CTRL_KEY('g'):
+      editorGotoLine();
       break;
 
+    case CTRL_KEY('w'):
+      editorToggleWrap();
+      break;
+
+    case CTRL_KEY('n'):
+      editorToggleLineNumbers();
+      break;
+
+    case CTRL_KEY('p'):
+      editorCommandPalette();
+      break;
+
+    case CTRL_KEY('o'):
+      editorOpenPrompt();
+      break;
 
     case CTRL_KEY('u'):
       undoAction();
@@ -1313,7 +1932,7 @@ int main(int argc, char *argv[]) {
   }
 
   editorSetStatusMessage(
-    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Ctrl-W wrap | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
+    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Ctrl-G goto | Ctrl-W wrap | Ctrl-N lines | Ctrl-P cmd | Ctrl-O open | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
 
   while (1) {
     editorRefreshScreen();
