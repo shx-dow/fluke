@@ -105,6 +105,12 @@ typedef struct erow {
   int hl_open_comment;
 } erow;
 
+/* mark system */
+typedef struct {
+  int cy, cx;
+  int set;
+} Mark;
+
 struct editorConfig {
   int cx, cy;
   int rx;
@@ -124,6 +130,8 @@ struct editorConfig {
   int soft_wrap_enabled;
   int vrowoff; /* visual row offset when wrapping */
   int show_line_numbers;
+  int read_only;
+  Mark marks[26]; /* marks a-z */
 };
 
 struct editorConfig E;
@@ -684,6 +692,10 @@ void editorRowDelChar(erow *row, int at) {
 /* editor operations */
 
 void editorInsertChar(int c) {
+  if (E.read_only) {
+    editorSetStatusMessage("Cannot edit in read-only mode");
+    return;
+  }
   pushUndoSnapshot();
   if (E.cy == E.numrows) {
     editorInsertRow(E.numrows, "", 0);
@@ -693,6 +705,10 @@ void editorInsertChar(int c) {
 }
 
 void editorInsertNewline() {
+  if (E.read_only) {
+    editorSetStatusMessage("Cannot edit in read-only mode");
+    return;
+  }
   pushUndoSnapshot();
   
   /* calculate indentation from current line */
@@ -732,6 +748,10 @@ void editorInsertNewline() {
 void editorDelChar() {
   if (E.cy == E.numrows) return;
   if (E.cx == 0 && E.cy == 0) return;
+  if (E.read_only) {
+    editorSetStatusMessage("Cannot edit in read-only mode");
+    return;
+  }
 
   pushUndoSnapshot();
   erow *row = &E.row[E.cy];
@@ -840,6 +860,42 @@ void editorSave() {
     close(fd);
   }
 
+  free(buf);
+  editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+void editorSaveAs() {
+  char *new_filename = editorPrompt("Save as: %s (ESC to cancel)", NULL);
+  if (new_filename == NULL) {
+    editorSetStatusMessage("Save as aborted");
+    return;
+  }
+
+  char *old_filename = E.filename;
+  E.filename = new_filename;
+  editorSelectSyntaxHighlight();
+
+  int len;
+  char *buf = editorRowsToString(&len);
+
+  int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+  if (fd != -1) {
+    if (ftruncate(fd, len) != -1) {
+      if (write(fd, buf, len) == len) {
+        close(fd);
+        free(buf);
+        E.dirty = 0;
+        editorSetStatusMessage("%d bytes written to %s", len, E.filename);
+        free(old_filename);
+        return;
+      }
+    }
+    close(fd);
+  }
+
+  /* restore old filename on error */
+  free(E.filename);
+  E.filename = old_filename;
   free(buf);
   editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
 }
@@ -990,18 +1046,65 @@ static void editorCycleTheme() {
   }
 }
 
+static void editorSetMark(char mark) {
+  if (mark < 'a' || mark > 'z') {
+    editorSetStatusMessage("Invalid mark: %c (use a-z)", mark);
+    return;
+  }
+  
+  int idx = mark - 'a';
+  E.marks[idx].cy = E.cy;
+  E.marks[idx].cx = E.cx;
+  E.marks[idx].set = 1;
+  editorSetStatusMessage("Mark %c set at line %d, col %d", mark, E.cy + 1, E.cx + 1);
+}
+
+static void editorJumpToMark(char mark) {
+  if (mark < 'a' || mark > 'z') {
+    editorSetStatusMessage("Invalid mark: %c (use a-z)", mark);
+    return;
+  }
+  
+  int idx = mark - 'a';
+  if (!E.marks[idx].set) {
+    editorSetStatusMessage("Mark %c not set", mark);
+    return;
+  }
+  
+  E.cy = E.marks[idx].cy;
+  E.cx = E.marks[idx].cx;
+  
+  /* validate position */
+  if (E.cy >= E.numrows) E.cy = E.numrows ? E.numrows - 1 : 0;
+  if (E.cy < 0) E.cy = 0;
+  
+  int rowlen = (E.cy < E.numrows) ? E.row[E.cy].size : 0;
+  if (E.cx > rowlen) E.cx = rowlen;
+  if (E.cx < 0) E.cx = 0;
+  
+  editorSetStatusMessage("Jumped to mark %c", mark);
+}
+
+static void editorToggleReadOnly() {
+  E.read_only = !E.read_only;
+  if (E.read_only && E.is_insert_mode) {
+    E.is_insert_mode = 0; /* exit insert mode when entering read-only */
+  }
+  editorSetStatusMessage("Read-only: %s", E.read_only ? "ON" : "OFF");
+}
+
 typedef struct CommandEntry {
   const char *name;
 } CommandEntry;
 
 /* command list must be defined before use */
 static const CommandEntry g_commands[] = {
-  {"save"}, {"write"},
+  {"save"}, {"write"}, {"saveas"},
   {"quit"}, {"quit!"},
   {"wrap"}, {"nowrap"},
   {"lines"}, {"nolines"},
   {"goto"}, {"find"},
-  {"open"}, {"theme"},
+  {"open"}, {"theme"}, {"marks"}, {"readonly"},
   {"help"}
 };
 
@@ -1021,6 +1124,8 @@ void editorCommandPalette() {
   /* simplistic matching: prefix or full */
   if (!strcmp(s, "save") || !strcmp(s, "write")) {
     editorSave();
+  } else if (!strcmp(s, "saveas")) {
+    editorSaveAs();
   } else if (!strcmp(s, "quit!")) {
     editorQuitNow();
   } else if (!strcmp(s, "quit")) {
@@ -1045,15 +1150,32 @@ void editorCommandPalette() {
     editorOpenPrompt();
   } else if (!strcmp(s, "theme")) {
     editorCycleTheme();
+  } else if (!strcmp(s, "marks")) {
+    /* show all set marks */
+    char msg[256] = "Set marks: ";
+    int found = 0;
+    for (int i = 0; i < 26; i++) {
+      if (E.marks[i].set) {
+        if (found > 0) strcat(msg, ", ");
+        char mark_info[32];
+        snprintf(mark_info, sizeof(mark_info), "%c(%d:%d)", 'a' + i, E.marks[i].cy + 1, E.marks[i].cx + 1);
+        strcat(msg, mark_info);
+        found++;
+      }
+    }
+    if (found == 0) strcat(msg, "none");
+    editorSetStatusMessage("%s", msg);
+  } else if (!strcmp(s, "readonly")) {
+    editorToggleReadOnly();
   } else if (!strcmp(s, "help")) {
-    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme");
+    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme, marks, readonly");
   } else {
     /* try partial match against known commands */
     int matched = 0;
     for (unsigned int i = 0; i < sizeof(g_commands)/sizeof(g_commands[0]); i++) {
       if (strstr(g_commands[i].name, s)) { matched = 1; break; }
     }
-    if (matched) editorSetStatusMessage("Did you mean: save | quit | quit! | wrap | nowrap | lines | nolines | goto | find | open | theme");
+    if (matched) editorSetStatusMessage("Did you mean: save | saveas | quit | quit! | wrap | nowrap | lines | nolines | goto | find | open | theme | marks | readonly");
     else editorSetStatusMessage("Unknown command: %s", s);
   }
 
@@ -1074,7 +1196,7 @@ static void commandPaletteCallback(char *query, int key) {
   } else if (query && *query) {
     editorSetStatusMessage("No match");
   } else {
-    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme");
+    editorSetStatusMessage("Commands: save, saveas, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme, marks, readonly");
   }
 }
 
@@ -1727,7 +1849,7 @@ void editorDrawStatusBar(struct abuf *ab) {
            themes[current_theme].status_bg, themes[current_theme].status_fg);
   abAppend(ab, status_color, strlen(status_color));
   char status[80], rstatus[80];
-  const char *mode = E.is_insert_mode ? "[INS]" : "[NOR]";
+  const char *mode = E.read_only ? "[RO]" : (E.is_insert_mode ? "[INS]" : "[NOR]");
   int len = snprintf(status, sizeof(status), "%.20s %s - %d lines %s",
     E.filename ? E.filename : "[No Name]", mode, E.numrows,
     E.dirty ? "(modified)" : "");
@@ -1909,6 +2031,12 @@ void editorProcessKeypress() {
     case CTRL_KEY('s'):
       editorSave();
       break;
+      
+    case CTRL_KEY('e'):
+      editorSaveAs();
+      break;
+
+
 
     case HOME_KEY:
       E.cx = 0;
@@ -1955,6 +2083,10 @@ void editorProcessKeypress() {
       editorCycleTheme();
       break;
 
+    case CTRL_KEY('l'):
+      editorToggleReadOnly();
+      break;
+
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
@@ -1988,9 +2120,6 @@ void editorProcessKeypress() {
       editorMoveCursor(c);
       break;
 
-    case CTRL_KEY('l'):
-      break;
-
     case '\x1b':
       E.is_insert_mode = 0; /* go to normal */
       break;
@@ -1999,13 +2128,41 @@ void editorProcessKeypress() {
       if (E.is_insert_mode) {
         editorInsertChar(c);
       } else {
-        /* simple normal-mode motions: h/j/k/l, x, i */
+        /* simple normal-mode motions: h/j/k/l, x, i, m, ' */
         if (c == 'h') editorMoveCursor(ARROW_LEFT);
         else if (c == 'l') editorMoveCursor(ARROW_RIGHT);
         else if (c == 'k') editorMoveCursor(ARROW_UP);
         else if (c == 'j') editorMoveCursor(ARROW_DOWN);
         else if (c == 'x') editorDelChar();
-        else if (c == 'i') E.is_insert_mode = 1;
+        else if (c == 'i') {
+          if (E.read_only) {
+            editorSetStatusMessage("Cannot enter insert mode in read-only mode");
+          } else {
+            E.is_insert_mode = 1;
+          }
+        }
+        else if (c == 'm') {
+          /* set mark - wait for next character */
+          editorSetStatusMessage("Mark: m_");
+          editorRefreshScreen();
+          int mark_char = editorReadKey();
+          if (mark_char >= 'a' && mark_char <= 'z') {
+            editorSetMark(mark_char);
+          } else {
+            editorSetStatusMessage("Invalid mark character");
+          }
+        }
+        else if (c == '\'') {
+          /* jump to mark - wait for next character */
+          editorSetStatusMessage("Jump to mark: '_");
+          editorRefreshScreen();
+          int mark_char = editorReadKey();
+          if (mark_char >= 'a' && mark_char <= 'z') {
+            editorJumpToMark(mark_char);
+          } else {
+            editorSetStatusMessage("Invalid mark character");
+          }
+        }
       }
       break;
   }
@@ -2032,6 +2189,14 @@ void initEditor() {
   E.soft_wrap_enabled = 0;
   E.vrowoff = 0;
   E.show_line_numbers = 1;
+  E.read_only = 0;
+
+  /* clear marks */
+  for (int i = 0; i < 26; i++) {
+    E.marks[i].set = 0;
+    E.marks[i].cy = 0;
+    E.marks[i].cx = 0;
+  }
 
   /* clear undo/redo stacks */
   for (int i = 0; i < g_undo_len; i++) freeSnapshot(g_undo_stack[i]);
@@ -2052,7 +2217,7 @@ int main(int argc, char *argv[]) {
   }
 
   editorSetStatusMessage(
-    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Ctrl-G goto | Ctrl-W wrap | Ctrl-N lines | Ctrl-P cmd | Ctrl-O open | Ctrl-T theme | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
+    "HELP: Ctrl-S save | Ctrl-E saveas | Ctrl-Q quit | Ctrl-F find | Ctrl-G goto | Ctrl-W wrap | Ctrl-N lines | Ctrl-P cmd | Ctrl-O open | Ctrl-T theme | Ctrl-L readonly | Esc normal | i insert | m mark | ' jump | Ctrl-U undo | Ctrl-R redo");
 
   while (1) {
     editorRefreshScreen();
