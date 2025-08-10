@@ -39,7 +39,9 @@ enum editorKey {
   HOME_KEY,
   END_KEY,
   PAGE_UP,
-  PAGE_DOWN
+  PAGE_DOWN,
+  CTRL_ARROW_LEFT,
+  CTRL_ARROW_RIGHT
 };
 
 enum editorHighlight {
@@ -52,6 +54,31 @@ enum editorHighlight {
   HL_NUMBER,
   HL_MATCH
 };
+
+/* theme system */
+typedef struct {
+  const char *name;
+  int normal;
+  int comment;
+  int keyword1;
+  int keyword2;
+  int string;
+  int number;
+  int match;
+  int line_number;
+  int status_bg;
+  int status_fg;
+} Theme;
+
+static const Theme themes[] = {
+  {"default", 37, 36, 33, 32, 35, 31, 34, 90, 7, 0},
+  {"dark", 37, 36, 93, 92, 95, 91, 94, 90, 7, 0},
+  {"light", 30, 34, 31, 32, 35, 33, 36, 90, 47, 30},
+  {"monokai", 37, 102, 197, 148, 186, 208, 81, 59, 235, 252},
+  {"solarized", 244, 61, 33, 37, 64, 166, 136, 240, 235, 230}
+};
+
+static int current_theme = 0;
 
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
 #define HL_HIGHLIGHT_STRINGS (1<<1)
@@ -288,7 +315,7 @@ int editorReadKey() {
   }
 
   if (c == '\x1b') {
-    char seq[3];
+    char seq[4];
 
     if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
     if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
@@ -305,6 +332,20 @@ int editorReadKey() {
             case '6': return PAGE_DOWN;
             case '7': return HOME_KEY;
             case '8': return END_KEY;
+          }
+        }
+      } else if (seq[1] == '1') {
+        if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+        if (seq[2] == ';') {
+          if (read(STDIN_FILENO, &seq[3], 1) != 1) return '\x1b';
+          if (seq[3] == '5') {
+            /* Ctrl+Arrow sequences */
+            char arrow;
+            if (read(STDIN_FILENO, &arrow, 1) != 1) return '\x1b';
+            switch (arrow) {
+              case 'C': return CTRL_ARROW_RIGHT;
+              case 'D': return CTRL_ARROW_LEFT;
+            }
           }
         }
       } else {
@@ -484,15 +525,16 @@ void editorUpdateSyntax(erow *row) {
 }
 
 int editorSyntaxToColor(int hl) {
+  const Theme *theme = &themes[current_theme];
   switch (hl) {
     case HL_COMMENT:
-    case HL_MLCOMMENT: return 36;
-    case HL_KEYWORD1: return 33;
-    case HL_KEYWORD2: return 32;
-    case HL_STRING: return 35;
-    case HL_NUMBER: return 31;
-    case HL_MATCH: return 34;
-    default: return 37;
+    case HL_MLCOMMENT: return theme->comment;
+    case HL_KEYWORD1: return theme->keyword1;
+    case HL_KEYWORD2: return theme->keyword2;
+    case HL_STRING: return theme->string;
+    case HL_NUMBER: return theme->number;
+    case HL_MATCH: return theme->match;
+    default: return theme->normal;
   }
 }
 
@@ -652,6 +694,16 @@ void editorInsertChar(int c) {
 
 void editorInsertNewline() {
   pushUndoSnapshot();
+  
+  /* calculate indentation from current line */
+  int indent = 0;
+  if (E.cy < E.numrows) {
+    erow *row = &E.row[E.cy];
+    while (indent < row->size && (row->chars[indent] == ' ' || row->chars[indent] == '\t')) {
+      indent++;
+    }
+  }
+  
   if (E.cx == 0) {
     editorInsertRow(E.cy, "", 0);
   } else {
@@ -664,6 +716,17 @@ void editorInsertNewline() {
   }
   E.cy++;
   E.cx = 0;
+  
+  /* apply auto-indent */
+  if (indent > 0 && E.cy < E.numrows) {
+    erow *newrow = &E.row[E.cy];
+    for (int i = 0; i < indent; i++) {
+      char indent_char = (E.cy > 0 && i < E.row[E.cy - 1].size) ? E.row[E.cy - 1].chars[i] : ' ';
+      if (indent_char != ' ' && indent_char != '\t') indent_char = ' ';
+      editorRowInsertChar(newrow, E.cx, indent_char);
+      E.cx++;
+    }
+  }
 }
 
 void editorDelChar() {
@@ -673,8 +736,28 @@ void editorDelChar() {
   pushUndoSnapshot();
   erow *row = &E.row[E.cy];
   if (E.cx > 0) {
-    editorRowDelChar(row, E.cx - 1);
-    E.cx--;
+    /* smart dedent: if we're at the beginning of indentation, remove a full indent level */
+    int is_indent_only = 1;
+    for (int i = 0; i < E.cx; i++) {
+      if (row->chars[i] != ' ' && row->chars[i] != '\t') {
+        is_indent_only = 0;
+        break;
+      }
+    }
+    
+    if (is_indent_only && E.cx >= FLUKE_TAB_STOP) {
+      /* remove up to tab stop worth of spaces */
+      int to_remove = E.cx % FLUKE_TAB_STOP;
+      if (to_remove == 0) to_remove = FLUKE_TAB_STOP;
+      
+      for (int i = 0; i < to_remove && E.cx > 0; i++) {
+        editorRowDelChar(row, E.cx - 1);
+        E.cx--;
+      }
+    } else {
+      editorRowDelChar(row, E.cx - 1);
+      E.cx--;
+    }
   } else {
     E.cx = E.row[E.cy - 1].size;
     editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
@@ -897,6 +980,16 @@ static void editorQuitNow() {
   exit(0);
 }
 
+static void editorCycleTheme() {
+  current_theme = (current_theme + 1) % (sizeof(themes) / sizeof(themes[0]));
+  editorSetStatusMessage("Theme: %s", themes[current_theme].name);
+  
+  /* refresh syntax highlighting for all rows */
+  for (int i = 0; i < E.numrows; i++) {
+    editorUpdateSyntax(&E.row[i]);
+  }
+}
+
 typedef struct CommandEntry {
   const char *name;
 } CommandEntry;
@@ -908,7 +1001,7 @@ static const CommandEntry g_commands[] = {
   {"wrap"}, {"nowrap"},
   {"lines"}, {"nolines"},
   {"goto"}, {"find"},
-  {"open"},
+  {"open"}, {"theme"},
   {"help"}
 };
 
@@ -950,15 +1043,17 @@ void editorCommandPalette() {
     editorFind();
   } else if (!strcmp(s, "open")) {
     editorOpenPrompt();
+  } else if (!strcmp(s, "theme")) {
+    editorCycleTheme();
   } else if (!strcmp(s, "help")) {
-    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open");
+    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme");
   } else {
     /* try partial match against known commands */
     int matched = 0;
     for (unsigned int i = 0; i < sizeof(g_commands)/sizeof(g_commands[0]); i++) {
       if (strstr(g_commands[i].name, s)) { matched = 1; break; }
     }
-    if (matched) editorSetStatusMessage("Did you mean: save | quit | quit! | wrap | nowrap | lines | nolines | goto | find | open");
+    if (matched) editorSetStatusMessage("Did you mean: save | quit | quit! | wrap | nowrap | lines | nolines | goto | find | open | theme");
     else editorSetStatusMessage("Unknown command: %s", s);
   }
 
@@ -979,7 +1074,7 @@ static void commandPaletteCallback(char *query, int key) {
   } else if (query && *query) {
     editorSetStatusMessage("No match");
   } else {
-    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open");
+    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme");
   }
 }
 
@@ -1556,7 +1651,9 @@ void editorDrawRows(struct abuf *ab) {
       char linenum[16];
       if (E.show_line_numbers) {
         snprintf(linenum, sizeof(linenum), "%*d ", FLUKE_LINE_NUMBER_WIDTH - 1, filerow + 1);
-        abAppend(ab, "\x1b[90m", 5); // Gray color for line numbers
+        char color_buf[16];
+        snprintf(color_buf, sizeof(color_buf), "\x1b[%dm", themes[current_theme].line_number);
+        abAppend(ab, color_buf, strlen(color_buf));
         abAppend(ab, linenum, strlen(linenum));
         abAppend(ab, "\x1b[39m", 5); // Reset to default color
       } else {
@@ -1625,7 +1722,10 @@ void editorDrawRows(struct abuf *ab) {
 }
 
 void editorDrawStatusBar(struct abuf *ab) {
-  abAppend(ab, "\x1b[7m", 4);
+  char status_color[16];
+  snprintf(status_color, sizeof(status_color), "\x1b[%d;%dm", 
+           themes[current_theme].status_bg, themes[current_theme].status_fg);
+  abAppend(ab, status_color, strlen(status_color));
   char status[80], rstatus[80];
   const char *mode = E.is_insert_mode ? "[INS]" : "[NOR]";
   int len = snprintf(status, sizeof(status), "%.20s %s - %d lines %s",
@@ -1761,6 +1861,20 @@ void editorMoveCursor(int key) {
         E.cy++;
       }
       break;
+    case CTRL_ARROW_LEFT:
+      /* Move to beginning of current word or previous word */
+      if (row) {
+        while (E.cx > 0 && !isalnum(row->chars[E.cx - 1]) && !row->chars[E.cx - 1] == '_') E.cx--;
+        while (E.cx > 0 && (isalnum(row->chars[E.cx - 1]) || row->chars[E.cx - 1] == '_')) E.cx--;
+      }
+      break;
+    case CTRL_ARROW_RIGHT:
+      /* Move to end of current word or next word */
+      if (row) {
+        while (E.cx < row->size && !isalnum(row->chars[E.cx]) && row->chars[E.cx] != '_') E.cx++;
+        while (E.cx < row->size && (isalnum(row->chars[E.cx]) || row->chars[E.cx] == '_')) E.cx++;
+      }
+      break;
   }
 
   row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
@@ -1837,6 +1951,10 @@ void editorProcessKeypress() {
       redoAction();
       break;
 
+    case CTRL_KEY('t'):
+      editorCycleTheme();
+      break;
+
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
@@ -1865,6 +1983,8 @@ void editorProcessKeypress() {
     case ARROW_DOWN:
     case ARROW_LEFT:
     case ARROW_RIGHT:
+    case CTRL_ARROW_LEFT:
+    case CTRL_ARROW_RIGHT:
       editorMoveCursor(c);
       break;
 
@@ -1932,7 +2052,7 @@ int main(int argc, char *argv[]) {
   }
 
   editorSetStatusMessage(
-    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Ctrl-G goto | Ctrl-W wrap | Ctrl-N lines | Ctrl-P cmd | Ctrl-O open | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
+    "HELP: Ctrl-S save | Ctrl-Q quit | Ctrl-F find | Ctrl-G goto | Ctrl-W wrap | Ctrl-N lines | Ctrl-P cmd | Ctrl-O open | Ctrl-T theme | Esc normal | i insert | Ctrl-U undo | Ctrl-R redo");
 
   while (1) {
     editorRefreshScreen();
