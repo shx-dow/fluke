@@ -276,20 +276,49 @@ void editorGotoLine();
 void editorCommandPalette();
 static void editorToggleWrap();
 static void editorToggleLineNumbers();
+static void freePalette();
+static void loadCommands();
+static void updatePaletteScores();
+/* append buffer definition */
+struct abuf {
+  char *b;
+  int len;
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf *ab, const char *s, int len) {
+  char *new = realloc(ab->b, ab->len + len);
+  if (new == NULL) return;
+  memcpy(&new[ab->len], s, len);
+  ab->b = new;
+  ab->len += len;
+}
+
+void abFree(struct abuf *ab) {
+  free(ab->b);
+}
+
+static void drawCommandPalette(struct abuf *ab);
 static void editorQuitNow();
 void editorOpenPrompt();
 static void persistCursorPositionIfAny();
 static void restoreCursorPositionIfAny();
 static int fuzzyScore(const char *pattern, const char *candidate);
-static void commandPaletteCallback(char *query, int key);
-static void openFilePromptCallback(char *query, int key);
+
+
 static void editorClearBuffer();
+static void loadConfig();
+static void saveConfig();
+static void editorAutosave();
+static void editorCheckRecovery();
+static void editorCleanupAutosave();
 
 /* terminal */
 
 void die(const char *s) {
-  (void)write(STDOUT_FILENO, "\x1b[2J", 4);
-  (void)write(STDOUT_FILENO, "\x1b[H", 3);
+  if (write(STDOUT_FILENO, "\x1b[2J", 4) == -1) { /* ignore error */ }
+  if (write(STDOUT_FILENO, "\x1b[H", 3) == -1) { /* ignore error */ }
 
   perror(s);
   exit(1);
@@ -347,9 +376,18 @@ int editorReadKey() {
         if (seq[2] == ';') {
           if (read(STDIN_FILENO, &seq[3], 1) != 1) return '\x1b';
           if (seq[3] == '5') {
-            /* Ctrl+Arrow sequences */
+            /* Ctrl+Arrow sequences - ESC[1;5C or ESC[1;5D */
             char arrow;
             if (read(STDIN_FILENO, &arrow, 1) != 1) return '\x1b';
+            switch (arrow) {
+              case 'C': return CTRL_ARROW_RIGHT;
+              case 'D': return CTRL_ARROW_LEFT;
+            }
+          } else if (seq[3] == '6') {
+            /* Ctrl+Shift+Arrow sequences - ESC[1;6C or ESC[1;6D */
+            char arrow;
+            if (read(STDIN_FILENO, &arrow, 1) != 1) return '\x1b';
+            /* For now, treat Ctrl+Shift+Arrow same as Ctrl+Arrow */
             switch (arrow) {
               case 'C': return CTRL_ARROW_RIGHT;
               case 'D': return CTRL_ARROW_LEFT;
@@ -366,6 +404,17 @@ int editorReadKey() {
           case 'F': return END_KEY;
         }
       }
+    } else if (seq[0] == 'O') {
+      switch (seq[1]) {
+        case 'H': return HOME_KEY;
+        case 'F': return END_KEY;
+      }
+    } else if (seq[0] == 'b') {
+      /* Some terminals send ESCb for Ctrl+Left (word back) */
+      return CTRL_ARROW_LEFT;
+    } else if (seq[0] == 'f') {
+      /* Some terminals send ESCf for Ctrl+Right (word forward) */
+      return CTRL_ARROW_RIGHT;
     } else if (seq[0] == 'O') {
       switch (seq[1]) {
         case 'H': return HOME_KEY;
@@ -831,6 +880,9 @@ void editorOpen(char *filename) {
 
   /* attempt to restore prior cursor position for this file */
   restoreCursorPositionIfAny();
+  
+  /* check for autosave recovery */
+  editorCheckRecovery();
 }
 
 void editorSave() {
@@ -1031,8 +1083,9 @@ static void editorToggleLineNumbers() {
 
 static void editorQuitNow() {
   persistCursorPositionIfAny();
-  write(STDOUT_FILENO, "\x1b[2J", 4);
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  editorCleanupAutosave();
+  if (write(STDOUT_FILENO, "\x1b[2J", 4) == -1) { /* ignore error */ }
+  if (write(STDOUT_FILENO, "\x1b[H", 3) == -1) { /* ignore error */ }
   exit(0);
 }
 
@@ -1093,9 +1146,80 @@ static void editorToggleReadOnly() {
   editorSetStatusMessage("Read-only: %s", E.read_only ? "ON" : "OFF");
 }
 
+static void editorShowHelp() {
+  /* Clear screen and show help */
+  if (write(STDOUT_FILENO, "\x1b[2J", 4) == -1) { /* ignore error */ }
+  if (write(STDOUT_FILENO, "\x1b[H", 3) == -1) { /* ignore error */ }
+  
+  const char *help_text = 
+    "\x1b[1;36m=== FLUKE EDITOR - KEYBINDING CHEATSHEET ===\x1b[0m\r\n\r\n"
+    "\x1b[1;33mFILE OPERATIONS:\x1b[0m\r\n"
+    "  Ctrl-S       Save file\r\n"
+    "  Ctrl-E       Save as (new filename)\r\n"
+    "  Ctrl-O       Open file (fuzzy finder)\r\n"
+    "  Ctrl-Q       Quit (with confirmation if unsaved)\r\n\r\n"
+    "\x1b[1;33mEDITING:\x1b[0m\r\n"
+    "  i            Enter insert mode\r\n"
+    "  Esc          Enter normal mode\r\n"
+    "  x            Delete character (normal mode)\r\n"
+    "  Ctrl-U       Undo\r\n"
+    "  Ctrl-R       Redo\r\n\r\n"
+    "\x1b[1;33mNAVIGATION:\x1b[0m\r\n"
+    "  Arrow keys   Move cursor\r\n"
+    "  h/j/k/l      Move cursor (normal mode)\r\n"
+    "  w/b          Word motion forward/backward (normal mode)\r\n"
+    "  Ctrl-Left    Move by word left (if supported)\r\n"
+    "  Ctrl-Right   Move by word right (if supported)\r\n"
+    "  Home/End     Beginning/end of line\r\n"
+    "  Page Up/Down Page navigation\r\n"
+    "  Ctrl-G       Go to line number\r\n\r\n"
+    "\x1b[1;33mMARKS:\x1b[0m\r\n"
+    "  m + letter   Set mark (ma, mb, etc.)\r\n"
+    "  ' + letter   Jump to mark ('a, 'b, etc.)\r\n\r\n"
+    "\x1b[1;33mSEARCH:\x1b[0m\r\n"
+    "  Ctrl-F       Find/search with highlighting\r\n"
+    "  Arrows       Navigate search results\r\n\r\n"
+    "\x1b[1;33mVIEW OPTIONS:\x1b[0m\r\n"
+    "  Ctrl-W       Toggle soft wrap\r\n"
+    "  Ctrl-N       Toggle line numbers\r\n"
+    "  Ctrl-T       Cycle themes\r\n"
+    "  Ctrl-L       Toggle read-only mode\r\n\r\n"
+    "\x1b[1;33mCOMMAND PALETTE:\x1b[0m\r\n"
+    "  Ctrl-P       Open command palette\r\n"
+    "  Commands:    save, saveas, quit, quit!, wrap, nowrap,\r\n"
+    "               lines, nolines, goto, find, open, theme,\r\n"
+    "               marks, readonly, config, help\r\n\r\n"
+    "\x1b[1;33mCONFIGURATION:\x1b[0m\r\n"
+    "  config       Save current settings to .flukerc\r\n"
+    "  Auto-save    Automatic backup every 30 seconds\r\n"
+    "  Recovery     Offers to restore from crash\r\n\r\n"
+    "\x1b[1;33mOTHER:\x1b[0m\r\n"
+    "  Ctrl-H       Show this help\r\n\r\n"
+    "\x1b[1;32mPress any key to return to editor...\x1b[0m";
+  
+  if (write(STDOUT_FILENO, help_text, strlen(help_text)) == -1) { /* ignore error */ }
+  
+  /* Wait for any key */
+  editorReadKey();
+  
+  /* Refresh the editor screen */
+  editorRefreshScreen();
+}
+
 typedef struct CommandEntry {
   const char *name;
 } CommandEntry;
+
+/* Command palette data structure */
+typedef struct {
+  char **commands;
+  int *scores;
+  int count;
+  int selected;
+  char search[256];
+} CommandPalette;
+
+static CommandPalette g_palette = {0};
 
 /* command list must be defined before use */
 static const CommandEntry g_commands[] = {
@@ -1105,52 +1229,212 @@ static const CommandEntry g_commands[] = {
   {"lines"}, {"nolines"},
   {"goto"}, {"find"},
   {"open"}, {"theme"}, {"marks"}, {"readonly"},
-  {"help"}
+  {"config"}, {"help"}
 };
 
-void editorCommandPalette() {
-  char *cmd = editorPrompt("Command: %s", commandPaletteCallback);
-  if (!cmd) return;
+/* Command palette implementations */
+static void freePalette() {
+  if (g_palette.commands) {
+    for (int i = 0; i < g_palette.count; i++) {
+      free(g_palette.commands[i]);
+    }
+    free(g_palette.commands);
+    free(g_palette.scores);
+  }
+  g_palette.commands = NULL;
+  g_palette.scores = NULL;
+  g_palette.count = 0;
+  g_palette.selected = 0;
+  g_palette.search[0] = '\0';
+}
 
-  /* trim leading/trailing spaces */
-  char *s = cmd;
-  while (*s && isspace((unsigned char)*s)) s++;
-  char *e = s + strlen(s);
-  while (e > s && isspace((unsigned char)e[-1])) e--;
-  *e = '\0';
+static void loadCommands() {
+  freePalette();
+  
+  /* Load all available commands */
+  const char *command_list[] = {
+    "save", "write", "saveas",
+    "quit", "quit!",
+    "wrap", "nowrap",
+    "lines", "nolines",
+    "goto", "find",
+    "open", "theme", "marks", "readonly",
+    "config", "help"
+  };
+  
+  int cmd_count = sizeof(command_list) / sizeof(command_list[0]);
+  
+  g_palette.commands = malloc(cmd_count * sizeof(char*));
+  g_palette.scores = malloc(cmd_count * sizeof(int));
+  g_palette.count = cmd_count;
+  
+  for (int i = 0; i < cmd_count; i++) {
+    g_palette.commands[i] = strdup(command_list[i]);
+    g_palette.scores[i] = 0;
+  }
+}
 
-  if (*s == '\0') { free(cmd); return; }
+static void updatePaletteScores() {
+  if (!g_palette.commands) return;
+  
+  for (int i = 0; i < g_palette.count; i++) {
+    if (g_palette.search[0] == '\0') {
+      g_palette.scores[i] = 1; /* show all commands when no search */
+    } else {
+      g_palette.scores[i] = fuzzyScore(g_palette.search, g_palette.commands[i]);
+    }
+  }
+  
+  /* Sort by score (simple bubble sort) */
+  for (int i = 0; i < g_palette.count - 1; i++) {
+    for (int j = 0; j < g_palette.count - i - 1; j++) {
+      if (g_palette.scores[j] < g_palette.scores[j + 1]) {
+        /* Swap scores */
+        int tempScore = g_palette.scores[j];
+        g_palette.scores[j] = g_palette.scores[j + 1];
+        g_palette.scores[j + 1] = tempScore;
+        
+        /* Swap commands */
+        char *tempCmd = g_palette.commands[j];
+        g_palette.commands[j] = g_palette.commands[j + 1];
+        g_palette.commands[j + 1] = tempCmd;
+      }
+    }
+  }
+  
+  /* Reset selection to first visible command */
+  g_palette.selected = 0;
+  if (g_palette.search[0] != '\0') {
+    for (int i = 0; i < g_palette.count; i++) {
+      if (g_palette.scores[i] > 0) {
+        g_palette.selected = i;
+        break;
+      }
+    }
+  }
+}
 
-  /* simplistic matching: prefix or full */
-  if (!strcmp(s, "save") || !strcmp(s, "write")) {
+static void drawCommandPalette(struct abuf *ab) {
+  int maxRows = E.screenrows - 8;
+  int maxCols = E.screencols - 6;
+  int startRow = 3;
+  int startCol = 3;
+  
+  /* Clear entire screen first */
+  abAppend(ab, "\x1b[2J", 4);
+  abAppend(ab, "\x1b[H", 3);
+  
+  /* Draw top border */
+  char topBorder[256];
+  snprintf(topBorder, sizeof(topBorder), "\x1b[%d;%dH", startRow, startCol);
+  abAppend(ab, topBorder, strlen(topBorder));
+  abAppend(ab, "\x1b[44;37m", 8); /* Blue background, white text */
+  abAppend(ab, "+", 1);
+  for (int i = 0; i < maxCols - 2; i++) abAppend(ab, "-", 1);
+  abAppend(ab, "+", 1);
+  abAppend(ab, "\x1b[m", 3); /* Reset */
+  
+  /* Draw title */
+  char titleLine[256];
+  snprintf(titleLine, sizeof(titleLine), "\x1b[%d;%dH\x1b[44;37m| COMMAND PALETTE - %d commands", 
+           startRow + 1, startCol, g_palette.count);
+  abAppend(ab, titleLine, strlen(titleLine));
+  
+  /* Pad title line */
+  int titleLen = strlen("| COMMAND PALETTE - ") + snprintf(NULL, 0, "%d commands", g_palette.count);
+  for (int i = titleLen; i < maxCols - 1; i++) abAppend(ab, " ", 1);
+  abAppend(ab, "|\x1b[m", 5);
+  
+  /* Draw search line */
+  char searchLine[512];
+  int searchWidth = maxCols - 12;
+  if (searchWidth < 0) searchWidth = 0;
+  if (searchWidth > 200) searchWidth = 200;
+  snprintf(searchLine, sizeof(searchLine), "\x1b[%d;%dH\x1b[44;37m| Search: %-*.*s|\x1b[m", 
+           startRow + 2, startCol, searchWidth, searchWidth, g_palette.search);
+  abAppend(ab, searchLine, strlen(searchLine));
+  
+  /* Draw separator */
+  char sepLine[256];
+  snprintf(sepLine, sizeof(sepLine), "\x1b[%d;%dH\x1b[44;37m+", startRow + 3, startCol);
+  abAppend(ab, sepLine, strlen(sepLine));
+  for (int i = 0; i < maxCols - 2; i++) abAppend(ab, "-", 1);
+  abAppend(ab, "+\x1b[m", 5);
+  
+  /* Draw commands */
+  int visibleCount = 0;
+  for (int i = 0; i < g_palette.count && visibleCount < maxRows - 4; i++) {
+    if (g_palette.scores[i] <= 0 && g_palette.search[0] != '\0') continue;
+    
+    char cmdLine[512];
+    int row = startRow + 4 + visibleCount;
+    
+    if (i == g_palette.selected) {
+      /* Selected command - highlighted */
+      snprintf(cmdLine, sizeof(cmdLine), "\x1b[%d;%dH\x1b[47;30m|>%-*.*s|\x1b[m", 
+               row, startCol, maxCols - 4, maxCols - 4, g_palette.commands[i]);
+    } else {
+      /* Normal command */
+      snprintf(cmdLine, sizeof(cmdLine), "\x1b[%d;%dH\x1b[44;37m| %-*.*s|\x1b[m", 
+               row, startCol, maxCols - 4, maxCols - 4, g_palette.commands[i]);
+    }
+    abAppend(ab, cmdLine, strlen(cmdLine));
+    visibleCount++;
+  }
+  
+  /* Fill remaining rows */
+  for (int i = visibleCount; i < maxRows - 4; i++) {
+    char emptyLine[256];
+    snprintf(emptyLine, sizeof(emptyLine), "\x1b[%d;%dH\x1b[44;37m|", startRow + 4 + i, startCol);
+    abAppend(ab, emptyLine, strlen(emptyLine));
+    for (int j = 0; j < maxCols - 2; j++) abAppend(ab, " ", 1);
+    abAppend(ab, "|\x1b[m", 5);
+  }
+  
+  /* Draw bottom border */
+  char bottomLine[256];
+  snprintf(bottomLine, sizeof(bottomLine), "\x1b[%d;%dH\x1b[44;37m+", startRow + maxRows, startCol);
+  abAppend(ab, bottomLine, strlen(bottomLine));
+  for (int i = 0; i < maxCols - 2; i++) abAppend(ab, "-", 1);
+  abAppend(ab, "+\x1b[m", 5);
+  
+  /* Draw help line */
+  char helpLine[256];
+  snprintf(helpLine, sizeof(helpLine), "\x1b[%d;%dH\x1b[43;30m ENTER=Execute | ESC=Cancel | UP/DOWN=Navigate | Type=Search \x1b[m", 
+           startRow + maxRows + 1, startCol);
+  abAppend(ab, helpLine, strlen(helpLine));
+}
+
+static void executeCommand(const char *cmd) {
+  if (!strcmp(cmd, "save") || !strcmp(cmd, "write")) {
     editorSave();
-  } else if (!strcmp(s, "saveas")) {
+  } else if (!strcmp(cmd, "saveas")) {
     editorSaveAs();
-  } else if (!strcmp(s, "quit!")) {
+  } else if (!strcmp(cmd, "quit!")) {
     editorQuitNow();
-  } else if (!strcmp(s, "quit")) {
+  } else if (!strcmp(cmd, "quit")) {
     if (E.dirty) {
       editorSetStatusMessage("Unsaved changes. Use quit! or Ctrl-Q to force quit.");
     } else {
       editorQuitNow();
     }
-  } else if (!strcmp(s, "wrap")) {
+  } else if (!strcmp(cmd, "wrap")) {
     if (!E.soft_wrap_enabled) editorToggleWrap(); else editorSetStatusMessage("Wrap: ON");
-  } else if (!strcmp(s, "nowrap")) {
+  } else if (!strcmp(cmd, "nowrap")) {
     if (E.soft_wrap_enabled) editorToggleWrap(); else editorSetStatusMessage("Wrap: OFF");
-  } else if (!strcmp(s, "lines")) {
+  } else if (!strcmp(cmd, "lines")) {
     if (!E.show_line_numbers) editorToggleLineNumbers(); else editorSetStatusMessage("Line numbers: ON");
-  } else if (!strcmp(s, "nolines")) {
+  } else if (!strcmp(cmd, "nolines")) {
     if (E.show_line_numbers) editorToggleLineNumbers(); else editorSetStatusMessage("Line numbers: OFF");
-  } else if (!strcmp(s, "goto")) {
+  } else if (!strcmp(cmd, "goto")) {
     editorGotoLine();
-  } else if (!strcmp(s, "find")) {
+  } else if (!strcmp(cmd, "find")) {
     editorFind();
-  } else if (!strcmp(s, "open")) {
+  } else if (!strcmp(cmd, "open")) {
     editorOpenPrompt();
-  } else if (!strcmp(s, "theme")) {
+  } else if (!strcmp(cmd, "theme")) {
     editorCycleTheme();
-  } else if (!strcmp(s, "marks")) {
+  } else if (!strcmp(cmd, "marks")) {
     /* show all set marks */
     char msg[256] = "Set marks: ";
     int found = 0;
@@ -1165,40 +1449,99 @@ void editorCommandPalette() {
     }
     if (found == 0) strcat(msg, "none");
     editorSetStatusMessage("%s", msg);
-  } else if (!strcmp(s, "readonly")) {
+  } else if (!strcmp(cmd, "readonly")) {
     editorToggleReadOnly();
-  } else if (!strcmp(s, "help")) {
-    editorSetStatusMessage("Commands: save, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme, marks, readonly");
+  } else if (!strcmp(cmd, "config")) {
+    saveConfig();
+    editorSetStatusMessage("Configuration saved to %s", ".flukerc");
+  } else if (!strcmp(cmd, "help")) {
+    editorShowHelp();
   } else {
-    /* try partial match against known commands */
-    int matched = 0;
-    for (unsigned int i = 0; i < sizeof(g_commands)/sizeof(g_commands[0]); i++) {
-      if (strstr(g_commands[i].name, s)) { matched = 1; break; }
+    editorSetStatusMessage("Unknown command: %s", cmd);
+  }
+}
+
+void editorCommandPalette() {
+  loadCommands();
+  updatePaletteScores();
+  
+  if (g_palette.count == 0) {
+    editorSetStatusMessage("No commands available");
+    freePalette();
+    return;
+  }
+  
+  /* Show cursor */
+  write(STDOUT_FILENO, "\x1b[?25h", 6);
+  
+  while (1) {
+    /* Draw palette */
+    struct abuf ab = ABUF_INIT;
+    drawCommandPalette(&ab);
+    
+    /* Position cursor in search box */
+    char cursorPos[32];
+    snprintf(cursorPos, sizeof(cursorPos), "\x1b[%d;%dH", 6, 13 + (int)strlen(g_palette.search));
+    abAppend(&ab, cursorPos, strlen(cursorPos));
+    
+    /* Flush to screen */
+    write(STDOUT_FILENO, ab.b, ab.len);
+    abFree(&ab);
+    
+    /* Get user input */
+    int c = editorReadKey();
+    
+    if (c == '\x1b') { /* Escape */
+      editorSetStatusMessage("Command canceled");
+      break;
+    } else if (c == '\r') { /* Enter */
+      if (g_palette.selected < g_palette.count) {
+        char *selectedCmd = g_palette.commands[g_palette.selected];
+        executeCommand(selectedCmd);
+      }
+      break;
+    } else if (c == ARROW_UP) {
+      if (g_palette.selected > 0) {
+        g_palette.selected--;
+        /* Skip invisible commands when searching */
+        while (g_palette.selected > 0 && g_palette.search[0] != '\0' && g_palette.scores[g_palette.selected] <= 0) {
+          g_palette.selected--;
+        }
+      }
+    } else if (c == ARROW_DOWN) {
+      if (g_palette.selected < g_palette.count - 1) {
+        g_palette.selected++;
+        /* Skip invisible commands when searching */
+        while (g_palette.selected < g_palette.count - 1 && g_palette.search[0] != '\0' && g_palette.scores[g_palette.selected] <= 0) {
+          g_palette.selected++;
+        }
+      }
+    } else if (c == BACKSPACE || c == DEL_KEY || c == CTRL_KEY('h')) {
+      /* Remove character from search */
+      int len = strlen(g_palette.search);
+      if (len > 0) {
+        g_palette.search[len - 1] = '\0';
+        updatePaletteScores();
+      }
+    } else if (!iscntrl(c) && c < 128) {
+      /* Add character to search */
+      size_t len = strlen(g_palette.search);
+      if (len < sizeof(g_palette.search) - 1) {
+        g_palette.search[len] = c;
+        g_palette.search[len + 1] = '\0';
+        updatePaletteScores();
+      }
     }
-    if (matched) editorSetStatusMessage("Did you mean: save | saveas | quit | quit! | wrap | nowrap | lines | nolines | goto | find | open | theme | marks | readonly");
-    else editorSetStatusMessage("Unknown command: %s", s);
   }
-
-  free(cmd);
+  
+  freePalette();
+  
+  /* Hide cursor and restore screen */
+  write(STDOUT_FILENO, "\x1b[?25l", 6);
+  editorRefreshScreen();
 }
 
-static void commandPaletteCallback(char *query, int key) {
-  (void)key; /* unused parameter */
-  if (!query) return;
-  int bestIdx = -1;
-  int bestScore = -1;
-  for (unsigned int i = 0; i < sizeof(g_commands)/sizeof(g_commands[0]); i++) {
-    int s = fuzzyScore(query, g_commands[i].name);
-    if (s > bestScore) { bestScore = s; bestIdx = (int)i; }
-  }
-  if (bestIdx >= 0 && bestScore > 0) {
-    editorSetStatusMessage("%s", g_commands[bestIdx].name);
-  } else if (query && *query) {
-    editorSetStatusMessage("No match");
-  } else {
-    editorSetStatusMessage("Commands: save, saveas, quit, quit!, wrap, nowrap, lines, nolines, goto, find, open, theme, marks, readonly");
-  }
-}
+
 
 /* File browser data structure */
 typedef struct {
@@ -1218,6 +1561,24 @@ void editorOpenPrompt(); /* Forward declaration */
 
 /* persistence of cursor position */
 static const char *cursor_state_filename = ".fluke_cursor";
+
+/* config system */
+static const char *config_filename = ".flukerc";
+
+/* autosave system */
+static const char *autosave_prefix = ".fluke_autosave_";
+static time_t last_autosave = 0;
+static const int autosave_interval = 30; /* seconds */
+
+typedef struct {
+  int default_theme;
+  int show_line_numbers;
+  int soft_wrap_enabled;
+  int tab_stop;
+  int insert_mode_default;
+} Config;
+
+/* removed unused default_config */
 
 static int getStateFilePath(char *out, size_t outsz) {
   const char *home = getenv("HOME");
@@ -1375,6 +1736,157 @@ static int fuzzyScore(const char *pattern, const char *candidate) {
   return score;
 }
 
+/* config loading */
+static void loadConfig() {
+  FILE *fp = fopen(config_filename, "r");
+  if (!fp) return; /* use defaults */
+  
+  char line[256];
+  while (fgets(line, sizeof(line), fp)) {
+    /* remove newline */
+    char *newline = strchr(line, '\n');
+    if (newline) *newline = '\0';
+    
+    /* skip comments and empty lines */
+    if (line[0] == '#' || line[0] == '\0') continue;
+    
+    /* parse key=value */
+    char *eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    char *key = line;
+    char *value = eq + 1;
+    
+    /* trim whitespace */
+    while (*key && isspace((unsigned char)*key)) key++;
+    while (*value && isspace((unsigned char)*value)) value++;
+    
+    /* apply settings */
+    if (strcmp(key, "theme") == 0) {
+      int theme_num = atoi(value);
+      if (theme_num >= 0 && theme_num < (int)(sizeof(themes) / sizeof(themes[0]))) {
+        current_theme = theme_num;
+      }
+    } else if (strcmp(key, "line_numbers") == 0) {
+      /* Trim trailing whitespace from value */
+      char *end = value + strlen(value) - 1;
+      while (end > value && isspace((unsigned char)*end)) end--;
+      end[1] = '\0';
+      
+      E.show_line_numbers = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+    } else if (strcmp(key, "soft_wrap") == 0) {
+      E.soft_wrap_enabled = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+    } else if (strcmp(key, "insert_mode") == 0) {
+      E.is_insert_mode = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0);
+    }
+  }
+  
+  fclose(fp);
+}
+
+static void saveConfig() {
+  FILE *fp = fopen(config_filename, "w");
+  if (!fp) return;
+  
+  fprintf(fp, "# Fluke Editor Configuration\n");
+  fprintf(fp, "# Theme: 0=default, 1=dark, 2=light, 3=monokai, 4=solarized\n");
+  fprintf(fp, "theme=%d\n", current_theme);
+  fprintf(fp, "line_numbers=%s\n", E.show_line_numbers ? "true" : "false");
+  fprintf(fp, "soft_wrap=%s\n", E.soft_wrap_enabled ? "true" : "false");
+  fprintf(fp, "insert_mode=%s\n", E.is_insert_mode ? "true" : "false");
+  
+  fclose(fp);
+}
+
+/* autosave functionality */
+static void getAutosaveFilename(char *buf, size_t bufsz) {
+  if (E.filename) {
+    snprintf(buf, bufsz, "%s%s", autosave_prefix, E.filename);
+  } else {
+    snprintf(buf, bufsz, "%suntitled", autosave_prefix);
+  }
+}
+
+static void editorAutosave() {
+  if (!E.dirty) return; /* no changes to save */
+  
+  time_t now = time(NULL);
+  if (now - last_autosave < autosave_interval) return; /* too soon */
+  
+  char autosave_file[256];
+  getAutosaveFilename(autosave_file, sizeof(autosave_file));
+  
+  int len;
+  char *buf = editorRowsToString(&len);
+  
+  FILE *fp = fopen(autosave_file, "w");
+  if (fp) {
+    fwrite(buf, 1, len, fp);
+    fclose(fp);
+    last_autosave = now;
+  }
+  
+  free(buf);
+}
+
+static void editorCheckRecovery() {
+  if (!E.filename) return;
+  
+  char autosave_file[256];
+  getAutosaveFilename(autosave_file, sizeof(autosave_file));
+  
+  struct stat autosave_stat, original_stat;
+  if (stat(autosave_file, &autosave_stat) != 0) return; /* no autosave file */
+  
+  if (stat(E.filename, &original_stat) == 0) {
+    /* both files exist, check if autosave is newer */
+    if (autosave_stat.st_mtime <= original_stat.st_mtime) {
+      unlink(autosave_file); /* autosave is older, remove it */
+      return;
+    }
+  }
+  
+  /* offer recovery */
+  char *response = editorPrompt("Autosave found. Recover? (y/N): %s", NULL);
+  if (response && (response[0] == 'y' || response[0] == 'Y')) {
+    /* load autosave file */
+    FILE *fp = fopen(autosave_file, "r");
+    if (fp) {
+      /* clear current buffer */
+      for (int i = 0; i < E.numrows; i++) editorFreeRow(&E.row[i]);
+      free(E.row);
+      E.row = NULL;
+      E.numrows = 0;
+      
+      /* load from autosave */
+      char *line = NULL;
+      size_t linecap = 0;
+      ssize_t linelen;
+      while ((linelen = getline(&line, &linecap, fp)) != -1) {
+        while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r'))
+          linelen--;
+        editorInsertRow(E.numrows, line, linelen);
+      }
+      free(line);
+      fclose(fp);
+      
+      E.dirty = 1; /* mark as modified */
+      editorSetStatusMessage("Recovered from autosave");
+    }
+  }
+  
+  if (response) free(response);
+  unlink(autosave_file); /* remove autosave file after recovery attempt */
+}
+
+static void editorCleanupAutosave() {
+  if (!E.filename) return;
+  
+  char autosave_file[256];
+  getAutosaveFilename(autosave_file, sizeof(autosave_file));
+  unlink(autosave_file); /* remove autosave file on clean exit */
+}
+
 /* clear current buffer contents */
 static void editorClearBuffer() {
   for (int i = 0; i < E.numrows; i++) editorFreeRow(&E.row[i]);
@@ -1386,27 +1898,7 @@ static void editorClearBuffer() {
   E.dirty = 0;
 }
 
-/* append buffer */
-
-struct abuf {
-  char *b;
-  int len;
-};
-
-#define ABUF_INIT {NULL, 0}
-
-void abAppend(struct abuf *ab, const char *s, int len) {
-  char *new = realloc(ab->b, ab->len + len);
-
-  if (new == NULL) return;
-  memcpy(&new[ab->len], s, len);
-  ab->b = new;
-  ab->len += len;
-}
-
-void abFree(struct abuf *ab) {
-  free(ab->b);
-}
+/* append buffer functions moved above */
 
 /* File browser implementations */
 static void freeBrowser() {
@@ -1610,7 +2102,7 @@ void editorOpenPrompt() {
   }
   
   /* Show cursor */
-  write(STDOUT_FILENO, "\x1b[?25h", 6);
+  if (write(STDOUT_FILENO, "\x1b[?25h", 6) == -1) { /* ignore error */ }
   
   while (1) {
     /* Draw browser */
@@ -1623,7 +2115,7 @@ void editorOpenPrompt() {
     abAppend(&ab, cursorPos, strlen(cursorPos));
     
     /* Flush to screen */
-    write(STDOUT_FILENO, ab.b, ab.len);
+    if (write(STDOUT_FILENO, ab.b, ab.len) == -1) { /* ignore error */ }
     abFree(&ab);
     
     /* Get user input */
@@ -1681,6 +2173,8 @@ void editorOpenPrompt() {
   editorRefreshScreen();
 }
 
+
+
 /* output */
 
 void editorScroll() {
@@ -1713,11 +2207,7 @@ void editorScroll() {
       int wraps = len > 0 ? (len - 1) / (E.screencols - FLUKE_LINE_NUMBER_WIDTH) : 0;
       vrow += 1 + wraps;
     }
-    int curline_wraps = 0;
-    if (E.cy < E.numrows) {
-      int len = E.row[E.cy].rsize;
-      curline_wraps = len > 0 ? (len - 1) / (E.screencols - FLUKE_LINE_NUMBER_WIDTH) : 0;
-    }
+    /* curline_wraps calculation removed as it was unused */
     int line_vrow = vrow;
 
     if (line_vrow < E.vrowoff) {
@@ -1780,10 +2270,9 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "\x1b[39m", 5); // Reset to default color
       } else {
         /* keep gutter spacing for consistent layout */
-        memset(linenum, ' ', FLUKE_LINE_NUMBER_WIDTH);
-        linenum[FLUKE_LINE_NUMBER_WIDTH - 1] = ' ';
-        linenum[FLUKE_LINE_NUMBER_WIDTH - 0] = '\0';
-        abAppend(ab, "      ", FLUKE_LINE_NUMBER_WIDTH);
+        for (int i = 0; i < FLUKE_LINE_NUMBER_WIDTH; i++) {
+          abAppend(ab, " ", 1);
+        }
       }
       int effective_coloff = E.soft_wrap_enabled ? start_col : E.coloff;
       int len = E.row[filerow].rsize - effective_coloff;
@@ -1986,7 +2475,7 @@ void editorMoveCursor(int key) {
     case CTRL_ARROW_LEFT:
       /* Move to beginning of current word or previous word */
       if (row) {
-        while (E.cx > 0 && !isalnum(row->chars[E.cx - 1]) && !row->chars[E.cx - 1] == '_') E.cx--;
+        while (E.cx > 0 && !isalnum(row->chars[E.cx - 1]) && row->chars[E.cx - 1] != '_') E.cx--;
         while (E.cx > 0 && (isalnum(row->chars[E.cx - 1]) || row->chars[E.cx - 1] == '_')) E.cx--;
       }
       break;
@@ -2087,8 +2576,11 @@ void editorProcessKeypress() {
       editorToggleReadOnly();
       break;
 
-    case BACKSPACE:
     case CTRL_KEY('h'):
+      editorShowHelp();
+      break;
+
+    case BACKSPACE:
     case DEL_KEY:
       if (!E.is_insert_mode) break;
       if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
@@ -2140,6 +2632,14 @@ void editorProcessKeypress() {
           } else {
             E.is_insert_mode = 1;
           }
+        }
+        else if (c == 'w') {
+          /* word motion forward in normal mode */
+          editorMoveCursor(CTRL_ARROW_RIGHT);
+        }
+        else if (c == 'b') {
+          /* word motion backward in normal mode */
+          editorMoveCursor(CTRL_ARROW_LEFT);
         }
         else if (c == 'm') {
           /* set mark - wait for next character */
@@ -2207,6 +2707,9 @@ void initEditor() {
   if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
   E.screenrows -= 2;
   E.screencols -= FLUKE_LINE_NUMBER_WIDTH;
+  
+  /* load configuration */
+  loadConfig();
 }
 
 int main(int argc, char *argv[]) {
@@ -2221,6 +2724,7 @@ int main(int argc, char *argv[]) {
 
   while (1) {
     editorRefreshScreen();
+    editorAutosave(); /* periodic autosave */
     editorProcessKeypress();
   }
 

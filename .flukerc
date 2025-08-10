@@ -1,0 +1,6 @@
+# Fluke Editor Configuration
+# Theme: 0=default, 1=dark, 2=light, 3=monokai, 4=solarized
+theme=0
+line_numbers=true
+soft_wrap=false
+insert_mode=true
